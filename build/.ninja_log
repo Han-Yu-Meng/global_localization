@@ -1,9 +1,0 @@
-# ninja log v5
-15003	15279	1778506583582710527	/home/steven/.fins/install/libnav_global_localization.so	8cb6674c6628d73e
-2478	2502	1778506570802712380	node_build/libcpu_bbs3d.a	b7635cfa6a32c05a
-0	2477	1778506570782712383	node_build/CMakeFiles/cpu_bbs3d.dir/bbs3d/src/cpu_bbs3d/voxelmaps_io.cpp.o	cf0946ca035c0096
-0	2102	1778506570402712435	node_build/CMakeFiles/cpu_bbs3d.dir/bbs3d/src/cpu_bbs3d/bbs3d.cpp.o	758163efe087902
-0	15002	1778506583302710570	node_build/CMakeFiles/global_localization.dir/node.cpp.o	4b70cb3121351ebf
-0	1231	1778506569532712557	node_build/CMakeFiles/cpu_bbs3d.dir/bbs3d/src/cpu_bbs3d/voxelmaps.cpp.o	73ffa81d286b9e85
-2	15595	1778507885002513190	node_build/CMakeFiles/global_localization.dir/node.cpp.o	4b70cb3121351ebf
-15595	15919	1778507885332513145	/home/steven/.fins/install/libnav_global_localization.so	8cb6674c6628d73e
