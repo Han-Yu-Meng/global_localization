@@ -1,0 +1,228 @@
+name: FINS Plugin CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              os: "20.04",
+              distro: "foxy",
+              arch: "amd64",
+              image: "ros:foxy-ros-base",
+            }
+          - {
+              os: "20.04",
+              distro: "foxy",
+              arch: "arm64",
+              image: "ros:foxy-ros-base",
+            }
+          - {
+              os: "22.04",
+              distro: "humble",
+              arch: "amd64",
+              image: "ros:humble-ros-base",
+            }
+          - {
+              os: "22.04",
+              distro: "humble",
+              arch: "arm64",
+              image: "ros:humble-ros-base",
+            }
+          - {
+              os: "24.04",
+              distro: "jazzy",
+              arch: "amd64",
+              image: "ros:jazzy-ros-base",
+            }
+          - {
+              os: "24.04",
+              distro: "jazzy",
+              arch: "arm64",
+              image: "ros:jazzy-ros-base",
+            }
+
+    container:
+      image: ${{ matrix.image }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Fix Permissions for Cache
+        run: |
+          sudo chown -R $(id -u):$(id -g) .
+
+      - name: Check for package.yaml
+        run: |
+          if [ ! -f "package.yaml" ]; then
+            echo "Error: package.yaml not found. This repository might not be a valid FINS plugin. Exiting..."
+            exit 1
+          fi
+
+      - name: Run Cppcheck
+        run: |
+          cppcheck --enable=all --inline-suppr --std=c++17 --output-file=cppcheck_report.txt . || true
+          if [ -s cppcheck_report.txt ]; then
+            echo "Cppcheck found issues:"
+            cat cppcheck_report.txt
+          else
+            echo "No Cppcheck issues found."
+          fi
+          
+      - name: Cache APT Archives
+        uses: actions/cache@v4
+        with:
+          path: apt-cache
+          key: apt-cache-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            apt-cache-${{ matrix.os }}-${{ matrix.arch }}-
+
+      - name: Install Basic Tools
+        run: |
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            sed -i 's|http://archive.ubuntu.com|http://ports.ubuntu.com|g' /etc/apt/sources.list
+            sed -i 's|http://security.ubuntu.com|http://ports.ubuntu.com|g' /etc/apt/sources.list
+            # Also check for newer Ubuntu versions that use sources.txt in /etc/apt/sources.list.d/
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sed -i 's|http://archive.ubuntu.com|http://ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+              sed -i 's|http://security.ubuntu.com|http://ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+          else
+            sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list
+            sed -i 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+              sed -i 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+          fi
+
+          rm -f /etc/apt/apt.conf.d/docker-clean || true
+          echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/01keep-debs
+
+          echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries
+          echo 'Acquire::http::Timeout "10";' >> /etc/apt/apt.conf.d/80-retries
+          echo 'Acquire::ForceIPv4 "true";' >> /etc/apt/apt.conf.d/80-retries
+
+          apt update -o Acquire::ForceIPv4=true --fix-missing
+          apt install -y --no-install-recommends curl git sudo jq ninja-build software-properties-common bc wget python3-yaml zip cppcheck
+
+      - name: Extract Package Name
+        id: pkg_info
+        run: |
+          PKG_NAME=$(python3 -c "import yaml; print(yaml.safe_load(open('package.yaml'))['name'])")
+          echo "PACKAGE_NAME=$PKG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Cache Fins Dependencies
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fins/dependencies
+          key: fins-deps-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            fins-deps-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Install Fins-CLI
+        run: |
+          for i in {1..5}; do
+            curl -fsSL --connect-timeout 5 --retry 3 https://raw.githubusercontent.com/Han-Yu-Meng/FineVision-CLI/main/install.sh | sudo bash && break || sleep 5
+          done
+          mkdir -p /github/home/.fins
+          cp -r /root/.fins/* /github/home/.fins/ || true
+
+      - name: Setup FINS Workspace
+        run: |
+          mkdir -p /github/home/.fins/logs
+          nohup finsd > /github/home/.fins/logs/finsd_boot.log 2>&1 &
+          sleep 3
+          fins workspace add Github@${{ github.repository_owner }}@${{ github.event.repository.name }}
+
+      - name: Solve Dependencies
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+
+          mkdir -p apt-cache
+          sudo rm -rf /var/cache/apt/archives
+          sudo ln -s $(pwd)/apt-cache /var/cache/apt/archives
+
+          sudo fins dep solve ${{ steps.pkg_info.outputs.PACKAGE_NAME }}
+
+          pkill finsd || true
+          sleep 2
+          nohup finsd > /github/home/.fins/logs/finsd_build.log 2>&1 &
+          sleep 3
+
+      - name: Build Plugins
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          set -e
+          fins build ${{ steps.pkg_info.outputs.PACKAGE_NAME }}
+          mkdir -p /github/home/artifacts
+          cd /github/home/.fins/install/
+          zip -r /github/home/artifacts/Ubuntu-${{ matrix.os }}-${{ matrix.arch }}.zip . \
+            -x "lib/*" -x "agent/*" -x "libfins_*" -x "include/*"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ubuntu-${{ matrix.os }}-${{ matrix.arch }}
+          path: /github/home/artifacts/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      (needs.build.result == 'success' || needs.build.result == 'failure' || needs.build.result == 'cancelled')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: final-release
+          pattern: Ubuntu-*
+          merge-multiple: true
+
+      - name: Check if any artifacts were downloaded
+        id: check_artifacts
+        run: |
+          if [ -d "final-release" ] && [ "$(ls -A final-release)" ]; then
+            echo "Artifacts found!"
+            echo "has_files=true" >> $GITHUB_OUTPUT
+          else
+            echo "No artifacts found. Skipping release creation."
+            echo "has_files=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        if: steps.check_artifacts.outputs.has_files == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-${{ github.sha }}
+          name: Release ${{ github.sha }}
+          body: |
+            Automated build for commit ${{ github.sha }}
+            Build results from GHA CI/CD.
+          files: final-release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
