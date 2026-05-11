@@ -240,9 +240,10 @@ private:
                 bbs3d_->set_trans_search_range(min_search_xyz_, max_search_xyz_);
                 bbs3d_->set_angular_search_range(min_search_rpy_, max_search_rpy_);
                 
-                auto t1 = std::chrono::high_resolution_clock::now();
-                bbs3d_->localize();
-                auto t2 = std::chrono::high_resolution_clock::now();
+                {
+                    auto t = this->recorder("bbs3d_localize", Measures.ts);
+                    bbs3d_->localize();
+                }
 
                 if (bbs3d_->has_localized()) {
                     Eigen::Isometry3d T_map_base_bbs(bbs3d_->get_global_pose());
