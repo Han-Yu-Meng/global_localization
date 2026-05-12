@@ -78,6 +78,7 @@ public:
 
     void define() override {
         set_name("GlobalLocalization");
+        set_category("Navigation>Localization");
         register_input<pcl::PointCloud<pcl::PointXYZI>::Ptr>("cloud", &GlobalLocalizationNode::on_cloud_callback);
         register_input<geometry_msgs::msg::TransformStamped>("$T_{odom}^{baselink}$", &GlobalLocalizationNode::on_odom_tf_callback);
 
