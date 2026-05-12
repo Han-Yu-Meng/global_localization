@@ -5,6 +5,7 @@
  ******************************************************************************/
 
 #include <fins/node.hpp>
+#include <fins/agent/parameter_server.hpp>
 #include <fins/utils/time.hpp>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -66,6 +67,7 @@ public:
 
     struct State {
         SystemState mode{SystemState::IDLE};
+        std::atomic<bool> map_ready{false}; // 新增标志位
         Eigen::Isometry3d T_map_odom{Eigen::Isometry3d::Identity()};
         int consecutive_gicp_failures = 0;
         
@@ -102,16 +104,40 @@ public:
         register_output<pcl::PointCloud<pcl::PointXYZI>::Ptr>("global_map_viz");
         register_output<pcl::PointCloud<pcl::PointXYZI>::Ptr>("aligned_cloud");
         register_output<geometry_msgs::msg::TransformStamped>("$T_{map}^{odom}$");
-
-        // 使用成员函数指针注册参数，解决 Lambda 和直接变量地址导致的编译错误
-        register_parameter<std::string>("global_map_path", &GlobalLocalizationNode::on_map_path_changed, std::string(""));
-        register_parameter<std::string>("voxel_map_dir", &GlobalLocalizationNode::on_voxel_dir_changed, std::string(""));
-        register_parameter<int>("max_gicp_failures", &GlobalLocalizationNode::on_max_failures_changed, 5);
     }
 
     void initialize() override {
         logger->info("Initializing Global Localization Node...");
+        std::cout << "Initialized" << std::endl;
+        
+        // 使用 ParamLoader 读取参数
+        fins::ParamLoader config("GlobalLocalization");
+        config_.min_search_xyz = config.get("min_search_xyz", Eigen::Vector3d{-100.0, -100.0, -2.0});
+        config_.max_search_xyz = config.get("max_search_xyz", Eigen::Vector3d{100.0, 100.0, 2.0});
+        config_.min_search_rpy = config.get("min_search_rpy", Eigen::Vector3d{0.0, 0.0, -M_PI});
+        config_.max_search_rpy = config.get("max_search_rpy", Eigen::Vector3d{0.0, 0.0, M_PI});
+        config_.num_threads = config.get("num_threads", 8);
+        config_.score_threshold = config.get("score_threshold", 0.3);
+        config_.accumulation_time = config.get("accumulation_time", 1.5);
+        config_.min_level_res = config.get("min_level_res", 1.5);
+        config_.max_level = config.get("max_level", 5);
+        config_.global_leaf_size = config.get("global_leaf_size", 0.8);
+        config_.registered_leaf_size = config.get("registered_leaf_size", 0.5);
+        config_.max_dist_sq_fine = config.get("max_dist_sq_fine", 4.0);
+        config_.max_dist_sq_bbs_refine = config.get("max_dist_sq_bbs_refine", 25.0);
+        config_.max_gicp_failures = config.get("max_gicp_failures", 5);
+        config_.voxel_dir = config.get("voxel_dir", std::string(""));
+        
         bbs3d_ = std::make_unique<cpu::BBS3D>();
+        
+        std::string global_map_path = config.get("map_dir", std::string(""));
+        logger->info("Map path from config: {}", global_map_path.empty() ? "empty" : global_map_path);
+        if (!global_map_path.empty()) {
+            load_map(global_map_path);
+        } else {
+            logger->warn("No map path specified in configuration. Map loading skipped.");
+        }
+        
         state_.is_running = true;
         worker_thread_ = std::thread(&GlobalLocalizationNode::worker_loop, this);
     }
@@ -121,11 +147,15 @@ public:
     
     void reset() override {
         std::lock_guard<std::mutex> lock(data_mtx_);
-        state_.mode = SystemState::COARSE_LOCALIZATION;
+        if (state_.map_ready) {
+            state_.mode = SystemState::COARSE_LOCALIZATION;
+        } else {
+            state_.mode = SystemState::IDLE;
+        }
         state_.accumulated_cloud_odom->clear();
         state_.accumulation_started = false;
         state_.consecutive_gicp_failures = 0;
-        logger->info("Node reset to COARSE mode.");
+        logger->info("Node reset to {} mode.", state_.map_ready ? "COARSE" : "IDLE");
     }
 
     ~GlobalLocalizationNode() {
@@ -136,16 +166,76 @@ public:
 
 private:
     // ==============================================================================
-    // 3. 参数 Setter 函数
+    // 3. 地图加载函数
     // ==============================================================================
-    void on_voxel_dir_changed(const std::string& dir) {
-        config_.voxel_dir = dir;
-        logger->info("Voxel directory set to: {}", dir);
-    }
+    void load_map(const std::string& path) {
+        state_.map_ready = false; // 进来先锁死
+        
+        logger->info("Loading map from: {}", path);
+        if (!fs::exists(path)) {
+            logger->error("Map file does not exist: {}", path);
+            return;
+        }
+        
+        // Check if bbs3d_ is initialized, if not, initialize it
+        if (!bbs3d_) {
+            bbs3d_ = std::make_unique<cpu::BBS3D>();
+        }
+        pcl::PointCloud<pcl::PointXYZI>::Ptr raw_map(new pcl::PointCloud<pcl::PointXYZI>());
+        if (pcl::io::loadPCDFile(path, *raw_map) == -1) {
+            logger->error("Failed to load PCD file: {}", path);
+            return;
+        }
+        
+        logger->info("Raw map loaded with {} points", raw_map->points.size());
 
-    void on_max_failures_changed(int val) {
-        config_.max_gicp_failures = val;
-        logger->info("Max GICP failures set to: {}", val);
+        auto map_viz = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*raw_map, 0.7);
+        auto map_algo = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*map_viz, config_.global_leaf_size);
+        
+        logger->info("Map downsampled: viz {} points, algo {} points", map_viz->points.size(), map_algo->points.size());
+        
+        target_covs_.reset(new pcl::PointCloud<pcl::PointCovariance>());
+        target_covs_->points.resize(map_algo->points.size());
+        for (size_t i = 0; i < map_algo->points.size(); ++i) target_covs_->points[i].getVector3fMap() = map_algo->points[i].getVector3fMap();
+        small_gicp::estimate_covariances_omp(*target_covs_, 20, config_.num_threads);
+        target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(target_covs_, small_gicp::KdTreeBuilderOMP(config_.num_threads));
+
+        bool voxel_loaded = false;
+        if (!config_.voxel_dir.empty() && fs::exists(config_.voxel_dir) && !fs::is_empty(config_.voxel_dir)) {
+            if (bbs3d_->load_voxel_params(config_.voxel_dir) && bbs3d_->set_multi_buckets(config_.voxel_dir)) voxel_loaded = true;
+        }
+        if (!voxel_loaded) {
+            logger->info("Building voxel grid in {}.", config_.voxel_dir);
+            std::vector<Eigen::Vector3d> tar_points;
+            for (auto& p : map_algo->points) tar_points.push_back(p.getVector3fMap().cast<double>());
+            bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
+            if (!config_.voxel_dir.empty()) {
+                fs::create_directories(config_.voxel_dir);
+                // 1. 保存配置参数
+                bbs3d_->save_voxel_params(config_.voxel_dir); 
+                // 2. 关键：保存具体的多层级体素桶数据
+                // 注意：set_multi_buckets 会自动保存数据，不需要单独的save函数
+                logger->info("Voxel map saved to {}", config_.voxel_dir);
+            }
+        }
+        bbs3d_->set_score_threshold_percentage(config_.score_threshold);
+        bbs3d_->set_num_threads(16);
+
+        // Set map_viz coordinate frame to 'map'
+        map_viz->header.frame_id = "map";
+        // map_viz->header.stamp = fins::to_nanos(fins::now());
+        
+        logger->info("BBS3D search range: XYZ [{}, {}, {}] to [{}, {}, {}]", 
+                   config_.min_search_xyz.x(), config_.min_search_xyz.y(), config_.min_search_xyz.z(),
+                   config_.max_search_xyz.x(), config_.max_search_xyz.y(), config_.max_search_xyz.z());
+        logger->info("BBS3D angular range: RPY [{}, {}, {}] to [{}, {}, {}]", 
+                   config_.min_search_rpy.x(), config_.min_search_rpy.y(), config_.min_search_rpy.z(),
+                   config_.max_search_rpy.x(), config_.max_search_rpy.y(), config_.max_search_rpy.z());
+
+        send("global_map_viz", map_viz, fins::now());
+        state_.map_ready = true; // 全部完成后才准许定位
+        state_.mode = SystemState::COARSE_LOCALIZATION;
+        logger->info("Map loaded and BBS3D initialized. Map ready for localization.");
     }
 
     // ==============================================================================
@@ -158,7 +248,9 @@ private:
     }
 
     void on_cloud_callback(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_raw, fins::AcqTime acq_time) {
-        if (state_.mode == SystemState::IDLE || !state_.tf_received || !state_.node_running) return;
+        if (!state_.map_ready || state_.mode == SystemState::IDLE) return;
+        
+        if (!state_.tf_received || !state_.node_running) return;
 
         std::unique_lock<std::mutex> lock(data_mtx_);
         double cur_time = fins::to_seconds(acq_time);
@@ -214,6 +306,17 @@ private:
     }
 
     void process_coarse(const JobData& job) {
+        // 增加安全检查
+        {
+            std::lock_guard<std::mutex> lock(data_mtx_);
+            if (!state_.map_ready || !bbs3d_) {
+                logger->warn("BBS3D skipped: Map not initialized.");
+                return;
+            }
+        }
+
+        logger->debug("Processing coarse localization with {} input points", job.cloud->points.size());
+
         pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_base(new pcl::PointCloud<pcl::PointXYZI>());
         pcl::transformPointCloud(*job.cloud, *cloud_base, job.T_odom_base.inverse().matrix().cast<float>());
         
@@ -222,12 +325,15 @@ private:
         
         pcl::VoxelGrid<pcl::PointXYZ> sor;
         sor.setInputCloud(cloud_bbs);
-        sor.setLeafSize(0.5f, 0.5f, 0.5f);
+        sor.setLeafSize(0.1f, 0.1f, 0.1f);
         sor.filter(*cloud_bbs);
 
         std::vector<Eigen::Vector3d> src_points;
         for (auto& p : cloud_bbs->points) src_points.push_back(p.getVector3fMap().cast<double>());
+        
+        logger->debug("BBS3D input: {} points after voxel filtering", src_points.size());
 
+        // 建议对 bbs3d_ 的调用块加锁，或者确认此处的原子性
         bbs3d_->set_src_points(src_points);
         bbs3d_->set_trans_search_range(config_.min_search_xyz, config_.max_search_xyz);
         bbs3d_->set_angular_search_range(config_.min_search_rpy, config_.max_search_rpy);
@@ -242,7 +348,27 @@ private:
         Eigen::Isometry3d T_map_base_bbs(bbs3d_->get_global_pose());
         T_map_base_bbs.linear() = Eigen::Quaterniond(T_map_base_bbs.linear()).normalized().toRotationMatrix();
         
+        // Add score and percentage logging like ROS2 version
+        logger->info("[3dBBS] Localized! Score: {} ({:.2f})", 
+                   bbs3d_->get_best_score(), bbs3d_->get_best_score_percentage() * 100.0);
+
+        // Convert rotation matrix to quaternion, then to Euler angles
+        Eigen::Quaterniond q_bbs(T_map_base_bbs.linear());
+        Eigen::Vector3d rpy_bbs = q_bbs.toRotationMatrix().eulerAngles(0, 1, 2);
+        
+        logger->info("[3dBBS] Coarse pose: xyz=[{:.3f}, {:.3f}, {:.3f}], rpy=[{:.3f}, {:.3f}, {:.3f}]",
+                   T_map_base_bbs.translation().x(), T_map_base_bbs.translation().y(), T_map_base_bbs.translation().z(),
+                   rpy_bbs.x(), rpy_bbs.y(), rpy_bbs.z());
+        
         Eigen::Isometry3d T_map_base_refined = refine_with_gicp(cloud_base, T_map_base_bbs, config_.max_dist_sq_bbs_refine);
+        
+        // Convert refined rotation matrix to quaternion, then to Euler angles
+        Eigen::Quaterniond q_refined(T_map_base_refined.linear());
+        Eigen::Vector3d rpy_refined = q_refined.toRotationMatrix().eulerAngles(0, 1, 2);
+        
+        logger->info("[GICP] Refined pose: xyz=[{:.3f}, {:.3f}, {:.3f}], rpy=[{:.3f}, {:.3f}, {:.3f}]",
+                   T_map_base_refined.translation().x(), T_map_base_refined.translation().y(), T_map_base_refined.translation().z(),
+                   rpy_refined.x(), rpy_refined.y(), rpy_refined.z());
         
         state_.T_map_odom = T_map_base_refined * job.T_odom_base.inverse();
         state_.mode = SystemState::FINE_LOCALIZATION;
@@ -292,41 +418,8 @@ private:
     }
 
     // ==============================================================================
-    // 6. 地图处理与发布
+    // 6. 结果发布
     // ==============================================================================
-    void on_map_path_changed(const std::string& path) {
-        if (!fs::exists(path)) return;
-        pcl::PointCloud<pcl::PointXYZI>::Ptr raw_map(new pcl::PointCloud<pcl::PointXYZI>());
-        if (pcl::io::loadPCDFile(path, *raw_map) == -1) return;
-
-        auto map_viz = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*raw_map, 0.7);
-        auto map_algo = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*map_viz, config_.global_leaf_size);
-        
-        target_covs_.reset(new pcl::PointCloud<pcl::PointCovariance>());
-        target_covs_->points.resize(map_algo->points.size());
-        for (size_t i = 0; i < map_algo->points.size(); ++i) target_covs_->points[i].getVector3fMap() = map_algo->points[i].getVector3fMap();
-        small_gicp::estimate_covariances_omp(*target_covs_, 20, config_.num_threads);
-        target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(target_covs_, small_gicp::KdTreeBuilderOMP(config_.num_threads));
-
-        bool voxel_loaded = false;
-        if (!config_.voxel_dir.empty() && fs::exists(config_.voxel_dir) && !fs::is_empty(config_.voxel_dir)) {
-            if (bbs3d_->load_voxel_params(config_.voxel_dir) && bbs3d_->set_multi_buckets(config_.voxel_dir)) voxel_loaded = true;
-        }
-        if (!voxel_loaded) {
-            std::vector<Eigen::Vector3d> tar_points;
-            for (auto& p : map_algo->points) tar_points.push_back(p.getVector3fMap().cast<double>());
-            bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
-            if (!config_.voxel_dir.empty()) {
-                fs::create_directories(config_.voxel_dir);
-                bbs3d_->save_voxel_params(config_.voxel_dir);
-            }
-        }
-        bbs3d_->set_score_threshold_percentage(config_.score_threshold);
-        bbs3d_->set_num_threads(16);
-
-        send("global_map_viz", map_viz, fins::now());
-        state_.mode = SystemState::COARSE_LOCALIZATION;
-    }
 
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& query) {
         geometry_msgs::msg::TransformStamped tf;
