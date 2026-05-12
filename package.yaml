@@ -10,6 +10,7 @@ depends:
   
   geometry_msgs: "system"
   nav_msgs: "system"
+  tf2_eigen: "system"
 
   PCL: "system"
   small_gicp: "1.0.0"

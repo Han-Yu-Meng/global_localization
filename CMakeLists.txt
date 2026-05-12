@@ -39,6 +39,7 @@ fins_add_node(${PROJECT_NAME}
 fins_link_ros_dependencies(${PROJECT_NAME}
   geometry_msgs
   nav_msgs
+  tf2_eigen
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE
