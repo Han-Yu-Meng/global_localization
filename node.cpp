@@ -45,7 +45,6 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     struct Config {
-        // 搜索范围保留默认值
         Eigen::Vector3d min_search_xyz{-100.0, -100.0, -2.0};
         Eigen::Vector3d max_search_xyz{100.0, 100.0, 2.0};
         Eigen::Vector3d min_search_rpy{0.0, 0.0, -M_PI};
@@ -60,11 +59,11 @@ public:
         double global_leaf_size = 0.8;
         double registered_leaf_size = 0.5;
         double bbs_leaf_size = 0.5;
-        double viz_leaf_size = 0.7;    // 新增参数：可视化地图采样粒度
+        double viz_leaf_size = 0.7;
         
         double max_dist_sq_fine = 4.0;
         double max_dist_sq_bbs_refine = 25.0;
-        double max_gicp_error = 60000.0; // 新增参数：GICP 容许最大误差阈值
+        double max_gicp_error = 60000.0;
         int max_gicp_failures = 5;
         std::string voxel_dir = "";
     };
@@ -113,8 +112,13 @@ public:
         worker_thread_ = std::thread(&GlobalLocalizationNode::worker_loop, this);
     }
 
-    void run() override { is_node_active_ = true; }
-    void pause() override { is_node_active_ = false; }
+    void run() override {
+        is_paused_ = false;
+        cv_.notify_one();
+    }
+    void pause() override {
+        is_paused_ = true;
+    }
     
     void reset() override {
         std::lock_guard<std::mutex> lock(data_mtx_);
@@ -138,7 +142,6 @@ private:
             return;
         }
 
-        // 使用配置参数 viz_leaf_size
         map_viz_cloud_ = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*raw_map, config_.viz_leaf_size);
         auto map_algo = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*map_viz_cloud_, config_.global_leaf_size);
         
@@ -169,7 +172,7 @@ private:
     }
 
     void on_cloud_callback(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom_in, fins::AcqTime acq_time) {
-        if (!map_ready_ || state_ == SystemState::IDLE || !is_node_active_ || !tf_received_) return;
+        if (!map_ready_ || state_ == SystemState::IDLE || !tf_received_) return;
 
         std::unique_lock<std::mutex> lock(data_mtx_);
         double cur_time = fins::to_seconds(acq_time);
@@ -200,8 +203,9 @@ private:
             JobData current_job;
             {
                 std::unique_lock<std::mutex> lock(data_mtx_);
-                cv_.wait(lock, [this] { return !is_worker_running_ || job_.has_new_job; });
+                cv_.wait(lock, [this] { return !is_worker_running_ || (!is_paused_ && job_.has_new_job); });
                 if (!is_worker_running_) break;
+                if (is_paused_) continue;
                 current_job = job_;
                 job_.has_new_job = false;
                 is_processing_job_ = true;
@@ -260,7 +264,14 @@ private:
             reg.reduction.num_threads = config_.num_threads;
             reg.rejector.max_dist_sq = config_.max_dist_sq_bbs_refine; 
 
+            auto t_refine_start = std::chrono::high_resolution_clock::now();
             auto res = reg.align(*target_covs_, *source_down, *target_tree_, T_map_base_bbs);
+            auto t_refine_end = std::chrono::high_resolution_clock::now();
+            double refine_duration_ms = std::chrono::duration<double, std::milli>(t_refine_end - t_refine_start).count();
+
+            logger->info("[3dBBS->GICP] Refine converged={}, error={:.2f}, iter={}, time={:.2f}ms", 
+                         res.converged, res.error, res.iterations, refine_duration_ms);
+
             Eigen::Isometry3d T_map_base_final = res.converged ? res.T_target_source : T_map_base_bbs;
 
             {
@@ -292,7 +303,6 @@ private:
         auto t_end = std::chrono::high_resolution_clock::now();
         double duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
-        // 使用配置中的 max_gicp_error
         if (result.converged && result.error < config_.max_gicp_error) {
             Eigen::Isometry3d T_delta = result.T_target_source * T_map_odom_.inverse();
             Eigen::Vector3d t_diff = T_delta.translation();
@@ -321,7 +331,6 @@ private:
     }
 
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom) {
-        // 1. 发送 TF
         geometry_msgs::msg::TransformStamped tf;
         tf.header.frame_id = "map";
         tf.child_frame_id = "odom";
@@ -339,7 +348,6 @@ private:
         
         send("$T_{map}^{odom}$", tf, ts);
 
-        // 2. 发送对齐后的点云
         if (required("aligned_cloud")) {
             pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::transformPointCloud(*cloud_odom, *aligned, T_map_odom_.matrix().cast<float>());
@@ -347,7 +355,6 @@ private:
             send("aligned_cloud", aligned, ts);
         }
 
-        // 3. 随着每个结果同步发送可视化全局地图
         if (map_ready_ && map_viz_cloud_ && required("global_map_viz")) {
             map_viz_cloud_->header.frame_id = "map";
             send("global_map_viz", map_viz_cloud_, ts);
@@ -357,7 +364,6 @@ private:
     Config config_;
     SystemState state_{SystemState::IDLE};
     bool map_ready_{false};
-    bool is_node_active_{false};
     bool tf_received_{false};
     
     Eigen::Isometry3d T_map_odom_{Eigen::Isometry3d::Identity()};
@@ -375,6 +381,7 @@ private:
     
     std::thread worker_thread_;
     std::atomic<bool> is_worker_running_{false};
+    std::atomic<bool> is_paused_{false};
 
     std::unique_ptr<cpu::BBS3D> bbs3d_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr map_viz_cloud_;
