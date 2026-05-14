@@ -7,7 +7,12 @@
 #include <fins/node.hpp>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2_eigen/tf2_eigen.hpp>
+
+#if __has_include(<tf2_eigen/tf2_eigen.hpp>)
+  #include <tf2_eigen/tf2_eigen.hpp>
+#else
+  #include <tf2_eigen/tf2_eigen.h>
+#endif
 
 #include <pcl/common/transforms.h>
 #include <pcl/io/pcd_io.h>
