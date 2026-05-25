@@ -7,6 +7,7 @@
 #include <fins/node.hpp>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 #if __has_include(<tf2_eigen/tf2_eigen.hpp>)
   #include <tf2_eigen/tf2_eigen.hpp>
@@ -87,6 +88,7 @@ public:
         register_output<pcl::PointCloud<pcl::PointXYZI>::Ptr>("global_map_viz");
         register_output<pcl::PointCloud<pcl::PointXYZI>::Ptr>("aligned_cloud");
         register_output<geometry_msgs::msg::TransformStamped>("$T_{map}^{odom}$");
+        register_output<geometry_msgs::msg::PoseStamped>("current_pose");
     }
 
     void initialize() override {
@@ -283,7 +285,7 @@ private:
                 state_ = SystemState::FINE_LOCALIZATION;
                 consecutive_gicp_failures_ = 0;
             }
-            publish_results(job.ts, job.cloud_odom);
+            publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
             logger->warn("[3dBBS] Localization failed. Time: {:.2f}ms", duration_ms);
         }
@@ -321,7 +323,7 @@ private:
                 T_map_odom_ = result.T_target_source;
                 consecutive_gicp_failures_ = 0;
             }
-            publish_results(job.ts, job.cloud_odom);
+            publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
             consecutive_gicp_failures_++;
             logger->warn("[GICP] Tracking Failed (converged={}, error={:.2f}). consecutive: {}", 
@@ -333,7 +335,7 @@ private:
         }
     }
 
-    void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom) {
+    void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
         geometry_msgs::msg::TransformStamped tf;
         tf.header.frame_id = "map";
         tf.child_frame_id = "odom";
@@ -350,6 +352,26 @@ private:
         tf.transform.rotation.z = q.z();
         
         send("$T_{map}^{odom}$", tf, ts);
+
+        if (required("current_pose")) {
+            Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
+            geometry_msgs::msg::PoseStamped pose;
+            pose.header.frame_id = "map";
+            pose.header.stamp = fins::to_ros_msg_time(fins::now());
+            
+            Eigen::Vector3d t_base = T_map_base.translation();
+            Eigen::Quaterniond q_base(T_map_base.rotation());
+            
+            pose.pose.position.x = t_base.x();
+            pose.pose.position.y = t_base.y();
+            pose.pose.position.z = t_base.z();
+            pose.pose.orientation.w = q_base.w();
+            pose.pose.orientation.x = q_base.x();
+            pose.pose.orientation.y = q_base.y();
+            pose.pose.orientation.z = q_base.z();
+            
+            send("current_pose", pose, ts);
+        }
 
         if (required("aligned_cloud")) {
             pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
