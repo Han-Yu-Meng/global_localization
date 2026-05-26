@@ -51,6 +51,18 @@ jobs:
               arch: "arm64",
               image: "ros:jazzy-ros-base",
             }
+          - {
+              os: "26.04",
+              distro: "lyrical",
+              arch: "amd64",
+              image: "ros:lyrical-ros-base",
+            }
+          - {
+              os: "26.04",
+              distro: "lyrical",
+              arch: "arm64",
+              image: "ros:lyrical-ros-base",
+            }
 
     container:
       image: ${{ matrix.image }}
