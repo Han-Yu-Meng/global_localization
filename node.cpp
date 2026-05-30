@@ -94,23 +94,58 @@ public:
     void initialize() override {
         fins::ParamLoader config("GlobalLocalization");
         
-        config_.num_threads = config.get("num_threads", 8);
-        config_.score_threshold = config.get("score_threshold", 0.3);
-        config_.accumulation_time = config.get("accumulation_time", 1.0);
-        config_.min_level_res = config.get("min_level_res", 1.5);
-        config_.max_level = config.get("max_level", 5);
-        config_.global_leaf_size = config.get("global_leaf_size", 0.8);
-        config_.registered_leaf_size = config.get("registered_leaf_size", 0.5);
-        config_.bbs_leaf_size = config.get("bbs_leaf_size", 0.5);
-        config_.viz_leaf_size = config.get("viz_leaf_size", 0.7);
-        config_.max_dist_sq_fine = config.get("max_dist_sq_fine", 4.0);
-        config_.max_gicp_error = config.get("max_gicp_error", 60000.0);
-        config_.voxel_dir = config.get("voxel_dir", std::string(""));
+        config_.num_threads = config.get("num_threads", 8)
+                                    .with_description("Number of threads for parallel processing (GICP covariance and 3dBBS search)")
+                                    .within(1, 128);
 
+        config_.score_threshold = config.get("score_threshold", 0.3)
+                                    .with_description("Minimum score percentage threshold for 3dBBS coarse localization")
+                                    .within(0.0, 10.0);
+        
+        config_.accumulation_time = config.get("accumulation_time", 1.0)
+                                    .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
+                                    .greater_than(0.0);
+                                    
+        config_.min_level_res = config.get("min_level_res", 1.5)
+                                    .with_description("Resolution of the lowest level in the 3dBBS multi-resolution pyramid (meters)")
+                                    .greater_than(0.0);
+        
+        config_.max_level = config.get("max_level", 5)
+                                    .with_description("Maximum number of levels in the 3dBBS multi-resolution pyramid");
+        
+        config_.global_leaf_size = config.get("global_leaf_size", 0.5)
+                                    .with_description("Voxel leaf size for the target global map points (meters)")
+                                    .greater_than(0.0);
+        
+        config_.registered_leaf_size = config.get("registered_leaf_size", 0.5)
+                                    .with_description("Voxel leaf size for source clouds during GICP fine registration (meters)")
+                                    .greater_than(0.0);
+        
+        config_.bbs_leaf_size = config.get("bbs_leaf_size", 0.5)
+                                    .with_description("Voxel leaf size for source clouds during 3dBBS coarse localization (meters)")
+                                    .within(0.05, 5.0);
+        
+        config_.viz_leaf_size = config.get("viz_leaf_size", 0.7)
+                                    .with_description("Voxel leaf size for visualization (meters)")
+                                    .greater_than(0.0);
+        
+        config_.max_dist_sq_fine = config.get("max_dist_sq_fine", 4.0)
+                                    .with_description("Maximum squared distance for GICP point correspondences (meters^2)")
+                                    .greater_than(0.0);
+        
+        config_.max_gicp_error = config.get("max_gicp_error", 60000.0)
+                                       .with_description("Threshold for GICP convergence error; results exceeding this are treated as failure")
+                                       .greater_than(0.0);
+        
+        config_.voxel_dir = config.get("voxel_dir", std::string(""))
+                                  .with_description("Directory path for storing preprocessed voxel maps");
+        
         bbs3d_ = std::make_unique<cpu::BBS3D>();
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
-        std::string map_path = config.get("map_dir", std::string(""));
+        std::string map_path = config.get("map_dir", std::string(""))
+                                     .with_description("Directory to load map file");
+        
         if (!map_path.empty()) load_map(map_path);
 
         is_worker_running_ = true;
