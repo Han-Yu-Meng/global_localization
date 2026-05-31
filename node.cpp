@@ -209,6 +209,11 @@ private:
         std::lock_guard<std::mutex> lock(data_mtx_);
         latest_T_odom_base_ = tf2::transformToEigen(*msg);
         tf_received_ = true;
+
+        // Publish current_pose if localization is active and map is ready
+        if (map_ready_ && state_ != SystemState::IDLE) {
+            publish_current_pose(msg.acq_time, latest_T_odom_base_);
+        }
     }
 
     void on_cloud_callback(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom_in, fins::AcqTime acq_time) {
@@ -370,6 +375,8 @@ private:
         }
     }
 
+
+
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
         geometry_msgs::msg::TransformStamped tf;
         tf.header.frame_id = "map";
@@ -388,11 +395,28 @@ private:
         
         send("$T_{map}^{odom}$", tf, ts);
 
+        // Call the new helper function
+        // publish_current_pose(ts, T_odom_base);
+
+        if (required("aligned_cloud")) {
+            pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
+            pcl::transformPointCloud(*cloud_odom, *aligned, T_map_odom_.matrix().cast<float>());
+            aligned->header.frame_id = "map";
+            send("aligned_cloud", aligned, ts);
+        }
+
+        if (map_ready_ && map_viz_cloud_ && required("global_map_viz")) {
+            map_viz_cloud_->header.frame_id = "map";
+            send("global_map_viz", map_viz_cloud_, ts);
+        }
+    }
+
+    void publish_current_pose(fins::AcqTime ts, const Eigen::Isometry3d& T_odom_base) {
         if (required("current_pose")) {
             Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
             geometry_msgs::msg::PoseStamped pose;
             pose.header.frame_id = "map";
-            pose.header.stamp = fins::to_ros_msg_time(fins::now());
+            pose.header.stamp = fins::to_ros_msg_time(ts); // Use the provided timestamp
             
             Eigen::Vector3d t_base = T_map_base.translation();
             Eigen::Quaterniond q_base(T_map_base.rotation());
@@ -406,18 +430,6 @@ private:
             pose.pose.orientation.z = q_base.z();
             
             send("current_pose", pose, ts);
-        }
-
-        if (required("aligned_cloud")) {
-            pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
-            pcl::transformPointCloud(*cloud_odom, *aligned, T_map_odom_.matrix().cast<float>());
-            aligned->header.frame_id = "map";
-            send("aligned_cloud", aligned, ts);
-        }
-
-        if (map_ready_ && map_viz_cloud_ && required("global_map_viz")) {
-            map_viz_cloud_->header.frame_id = "map";
-            send("global_map_viz", map_viz_cloud_, ts);
         }
     }
 
