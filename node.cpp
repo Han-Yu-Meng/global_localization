@@ -203,6 +203,11 @@ private:
         state_ = SystemState::COARSE_LOCALIZATION;
         logger->info("Global Map loaded. Algo points: {}, Viz points: {}, Viz Grid: {}m", 
                      map_algo->size(), map_viz_cloud_->size(), config_.viz_leaf_size);
+                     
+        if (map_viz_cloud_ && required("global_map_viz")) {
+            map_viz_cloud_->header.frame_id = "map";
+            send("global_map_viz", map_viz_cloud_, fins::now());
+        }
     }
 
     void on_odom_tf_callback(const fins::Msg<geometry_msgs::msg::TransformStamped>& msg) {
@@ -210,7 +215,6 @@ private:
         latest_T_odom_base_ = tf2::transformToEigen(*msg);
         tf_received_ = true;
 
-        // Publish current_pose if localization is active and map is ready
         if (map_ready_ && state_ != SystemState::IDLE) {
             publish_current_pose(msg.acq_time, latest_T_odom_base_);
         }
@@ -395,19 +399,11 @@ private:
         
         send("$T_{map}^{odom}$", tf, ts);
 
-        // Call the new helper function
-        // publish_current_pose(ts, T_odom_base);
-
         if (required("aligned_cloud")) {
             pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::transformPointCloud(*cloud_odom, *aligned, T_map_odom_.matrix().cast<float>());
             aligned->header.frame_id = "map";
             send("aligned_cloud", aligned, ts);
-        }
-
-        if (map_ready_ && map_viz_cloud_ && required("global_map_viz")) {
-            map_viz_cloud_->header.frame_id = "map";
-            send("global_map_viz", map_viz_cloud_, ts);
         }
     }
 
