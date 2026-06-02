@@ -382,7 +382,37 @@ private:
 
 
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
+    /*
         geometry_msgs::msg::TransformStamped tf;
+    	tf.header.stamp = fins::to_ros_msg_time(ts);
+        tf.header.frame_id = "map";
+        tf.child_frame_id = "odom";
+        
+        Eigen::Vector3d t = T_map_odom_.translation();
+        Eigen::Quaterniond q(T_map_odom_.rotation());
+        
+        tf.transform.translation.x = t.x();
+        tf.transform.translation.y = t.y();
+        tf.transform.translation.z = t.z();
+        tf.transform.rotation.w = q.w();
+        tf.transform.rotation.x = q.x();
+        tf.transform.rotation.y = q.y();
+        tf.transform.rotation.z = q.z();
+        
+        send("$T_{map}^{odom}$", tf, ts);*/
+
+        if (required("aligned_cloud")) {
+            pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
+            pcl::transformPointCloud(*cloud_odom, *aligned, T_map_odom_.matrix().cast<float>());
+            aligned->header.frame_id = "map";
+            send("aligned_cloud", aligned, ts);
+        }
+    }
+
+    void publish_current_pose(fins::AcqTime ts, const Eigen::Isometry3d& T_odom_base) {
+    
+        geometry_msgs::msg::TransformStamped tf;
+    	tf.header.stamp = fins::to_ros_msg_time(ts);
         tf.header.frame_id = "map";
         tf.child_frame_id = "odom";
         
@@ -398,16 +428,7 @@ private:
         tf.transform.rotation.z = q.z();
         
         send("$T_{map}^{odom}$", tf, ts);
-
-        if (required("aligned_cloud")) {
-            pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>());
-            pcl::transformPointCloud(*cloud_odom, *aligned, T_map_odom_.matrix().cast<float>());
-            aligned->header.frame_id = "map";
-            send("aligned_cloud", aligned, ts);
-        }
-    }
-
-    void publish_current_pose(fins::AcqTime ts, const Eigen::Isometry3d& T_odom_base) {
+        
         if (required("current_pose")) {
             Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
             geometry_msgs::msg::PoseStamped pose;
