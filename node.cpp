@@ -49,15 +49,16 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     struct Config {
-        Eigen::Vector3d min_search_xyz{-100.0, -100.0, -2.0};
-        Eigen::Vector3d max_search_xyz{100.0, 100.0, 2.0};
+        Eigen::Vector3d min_search_xyz{-10.0, -20.0, -0.05};
+        Eigen::Vector3d max_search_xyz{200.0, 500.0, 0.05};
         Eigen::Vector3d min_search_rpy{0.0, 0.0, -M_PI};
         Eigen::Vector3d max_search_rpy{0.0, 0.0, M_PI};
         
         int num_threads = 8;
         double score_threshold = 0.3;
         double accumulation_time = 1.0;
-        
+        double tracking_interval = 1.0;
+
         double min_level_res = 1.5;
         int max_level = 5;
         double global_leaf_size = 0.8;
@@ -105,7 +106,11 @@ public:
         config_.accumulation_time = config.get("accumulation_time", 1.0)
                                     .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
                                     .greater_than(0.0);
-                                    
+
+        config_.tracking_interval = config.get("tracking_interval", 1.0)
+                                    .with_description("Time interval between GICP tracking updates (seconds)")
+                                    .greater_than(0.0);
+
         config_.min_level_res = config.get("min_level_res", 1.5)
                                     .with_description("Resolution of the lowest level in the 3dBBS multi-resolution pyramid (meters)")
                                     .greater_than(0.0);
@@ -226,6 +231,24 @@ private:
         std::unique_lock<std::mutex> lock(data_mtx_);
         double cur_time = fins::to_seconds(acq_time);
 
+        // ================== 核心优化：精定位阶段限制触发频率 ==================
+        if (state_ == SystemState::FINE_LOCALIZATION) {
+            double elapsed = cur_time - last_gicp_run_time_;
+            if (elapsed >= config_.tracking_interval) {
+                if (!is_processing_job_) {
+                    job_.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(*cloud_odom_in));
+                    job_.ts = acq_time;
+                    job_.T_odom_base = latest_T_odom_base_;
+                    job_.has_new_job = true;
+                    last_gicp_run_time_ = cur_time;
+                    cv_.notify_one();
+                }
+            }
+            return; // 结束回调
+        }
+        // =================================================================================
+
+        // 仅在粗定位（BBS）阶段进行 1.0 秒的点云累积
         if (!accumulation_started_) {
             accumulation_started_ = true;
             start_accumulation_time_ = cur_time;
@@ -246,7 +269,6 @@ private:
             accumulation_started_ = false;
         }
     }
-
     void worker_loop() {
         while (is_worker_running_) {
             JobData current_job;
@@ -338,48 +360,56 @@ private:
     void perform_fine_tracking(const JobData& job) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
+        // 1. 将 Odom 系下的累积点云转换到当前 base_link 坐标系下
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_base(new pcl::PointCloud<pcl::PointXYZI>());
+        pcl::transformPointCloud(*job.cloud_odom, *cloud_base, job.T_odom_base.inverse().matrix().cast<float>());
+
+        // 2. 对 base_link 系下的点云进行下采样
         pcl::PointCloud<pcl::PointCovariance>::Ptr source_down = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointCovariance>>(
-            *job.cloud_odom, config_.registered_leaf_size, config_.num_threads);
+            *cloud_base, config_.registered_leaf_size, config_.num_threads);
         
         small_gicp::estimate_covariances_omp(*source_down, 20, config_.num_threads);
+
+        // 3. 计算基于里程计预测的 T_map_base 初始估计
+        Eigen::Isometry3d T_map_base_init = T_map_odom_ * job.T_odom_base;
 
         small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
         reg.reduction.num_threads = config_.num_threads;
         reg.rejector.max_dist_sq = config_.max_dist_sq_fine; 
         
-        auto result = reg.align(*target_covs_, *source_down, *target_tree_, T_map_odom_);
+        // 4. 在 base_link 系下进行配准
+        auto result = reg.align(*target_covs_, *source_down, *target_tree_, T_map_base_init);
         
         auto t_end = std::chrono::high_resolution_clock::now();
         double duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
         if (result.converged && result.error < config_.max_gicp_error) {
-            Eigen::Isometry3d T_delta = result.T_target_source * T_map_odom_.inverse();
+            Eigen::Isometry3d T_delta = result.T_target_source * T_map_base_init.inverse();
             Eigen::Vector3d t_diff = T_delta.translation();
             Eigen::Vector3d rpy_diff = T_delta.linear().eulerAngles(0, 1, 2) * 180.0 / M_PI;
 
             logger->info("[GICP] Result: converged={}, error={:.2f}, iter={}, time={:.2f}ms | Delta: xyz[{:.3f} {:.3f} {:.3f}] rpy[{:.3f} {:.3f} {:.3f} deg]",
-                         result.converged, result.error, result.iterations, duration_ms,
-                         t_diff.x(), t_diff.y(), t_diff.z(),
-                         rpy_diff.x(), rpy_diff.y(), rpy_diff.z());
+                        result.converged, result.error, result.iterations, duration_ms,
+                        t_diff.x(), t_diff.y(), t_diff.z(),
+                        rpy_diff.x(), rpy_diff.y(), rpy_diff.z());
 
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
-                T_map_odom_ = result.T_target_source;
+                // 5. 根据配准后的 T_map_base 更新 T_map_odom
+                T_map_odom_ = result.T_target_source * job.T_odom_base.inverse();
                 consecutive_gicp_failures_ = 0;
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
             consecutive_gicp_failures_++;
             logger->warn("[GICP] Tracking Failed (converged={}, error={:.2f}). consecutive: {}", 
-                         result.converged, result.error, consecutive_gicp_failures_);
+                        result.converged, result.error, consecutive_gicp_failures_);
             if (consecutive_gicp_failures_ >= config_.max_gicp_failures) {
                 logger->error("[GICP] Too many failures, Resetting to COARSE.");
                 state_ = SystemState::COARSE_LOCALIZATION;
             }
         }
     }
-
-
 
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
         geometry_msgs::msg::TransformStamped tf;
@@ -440,6 +470,7 @@ private:
     int consecutive_gicp_failures_ = 0;
     bool accumulation_started_ = false;
     double start_accumulation_time_ = 0.0;
+    double last_gicp_run_time_ = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr accumulated_cloud_odom_;
 
     JobData job_;
