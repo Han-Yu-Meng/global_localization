@@ -71,6 +71,10 @@ public:
         double max_gicp_error = 60000.0;
         int max_gicp_failures = 5;
         std::string voxel_dir = "";
+
+        // Smoothing filter for T_map_odom to prevent localization_pose jumps
+        bool smooth_enabled = false;
+        double smooth_alpha = 0.3;  // 0.0 = frozen, 1.0 = no smoothing
     };
 
     struct JobData {
@@ -144,6 +148,13 @@ public:
         
         config_.voxel_dir = config.get("voxel_dir", std::string(""))
                                   .with_description("Directory path for storing preprocessed voxel maps");
+
+        config_.smooth_enabled = config.get("smooth_enabled", false)
+                                     .with_description("Enable EMA smoothing filter on T_map_odom to prevent localization_pose jumps");
+
+        config_.smooth_alpha = config.get("smooth_alpha", 0.3)
+                                    .with_description("Smoothing factor for EMA filter (0.0 = frozen, 1.0 = no smoothing). Lower = smoother but more lag.")
+                                    .within(0.0, 1.0);
         
         bbs3d_ = std::make_unique<cpu::BBS3D>();
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
@@ -171,6 +182,7 @@ public:
         accumulated_cloud_odom_->clear();
         accumulation_started_ = false;
         consecutive_gicp_failures_ = 0;
+        has_filtered_pose_ = false;
     }
 
     ~GlobalLocalizationNode() {
@@ -348,6 +360,8 @@ private:
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
                 T_map_odom_ = T_map_base_final * job.T_odom_base.inverse();
+                // 初始化平滑滤波器状态，使后续精定位从当前值开始平滑
+                has_filtered_pose_ = false;
                 state_ = SystemState::FINE_LOCALIZATION;
                 consecutive_gicp_failures_ = 0;
             }
@@ -395,8 +409,9 @@ private:
 
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
-                // 5. 根据配准后的 T_map_base 更新 T_map_odom
-                T_map_odom_ = result.T_target_source * job.T_odom_base.inverse();
+                // 5. 根据配准后的 T_map_base 更新 T_map_odom（原始值），然后应用平滑滤波
+                Eigen::Isometry3d T_map_odom_raw = result.T_target_source * job.T_odom_base.inverse();
+                T_map_odom_ = apply_smooth_filter(T_map_odom_raw);
                 consecutive_gicp_failures_ = 0;
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
@@ -409,6 +424,52 @@ private:
                 state_ = SystemState::COARSE_LOCALIZATION;
             }
         }
+    }
+
+    Eigen::Isometry3d apply_smooth_filter(const Eigen::Isometry3d& raw_T_map_odom) {
+        if (!config_.smooth_enabled) {
+            return raw_T_map_odom;
+        }
+
+        if (!has_filtered_pose_) {
+            T_map_odom_filtered_ = raw_T_map_odom;
+            has_filtered_pose_ = true;
+            return raw_T_map_odom;
+        }
+
+        // Extract translation and rotation from previous filtered pose
+        Eigen::Vector3d t_prev = T_map_odom_filtered_.translation();
+        Eigen::Quaterniond q_prev(T_map_odom_filtered_.rotation());
+        q_prev.normalize();
+
+        // Extract translation and rotation from new raw pose
+        Eigen::Vector3d t_raw = raw_T_map_odom.translation();
+        Eigen::Quaterniond q_raw(raw_T_map_odom.rotation());
+        q_raw.normalize();
+
+        // EMA for translation: linear interpolation
+        Eigen::Vector3d t_smooth = config_.smooth_alpha * t_raw + (1.0 - config_.smooth_alpha) * t_prev;
+
+        // EMA for rotation: spherical linear interpolation (slerp)
+        Eigen::Quaterniond q_smooth = q_prev.slerp(config_.smooth_alpha, q_raw);
+        q_smooth.normalize();
+
+        // Build filtered pose
+        Eigen::Isometry3d filtered = Eigen::Isometry3d::Identity();
+        filtered.translation() = t_smooth;
+        filtered.linear() = q_smooth.toRotationMatrix();
+
+        T_map_odom_filtered_ = filtered;
+
+        double trans_delta = (t_raw - t_prev).norm();
+        double rot_delta = q_prev.angularDistance(q_raw) * 180.0 / M_PI;
+        logger->debug("[Smooth] Raw delta: trans={:.3f}m rot={:.2f}deg | Filtered delta: trans={:.3f}m rot={:.2f}deg | alpha={:.2f}",
+                      trans_delta, rot_delta,
+                      (t_smooth - t_prev).norm(),
+                      q_prev.angularDistance(q_smooth) * 180.0 / M_PI,
+                      config_.smooth_alpha);
+
+        return filtered;
     }
 
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
@@ -466,6 +527,10 @@ private:
     
     Eigen::Isometry3d T_map_odom_{Eigen::Isometry3d::Identity()};
     Eigen::Isometry3d latest_T_odom_base_{Eigen::Isometry3d::Identity()};
+
+    // Smoothing filter state
+    bool has_filtered_pose_{false};
+    Eigen::Isometry3d T_map_odom_filtered_{Eigen::Isometry3d::Identity()};
     
     int consecutive_gicp_failures_ = 0;
     bool accumulation_started_ = false;
