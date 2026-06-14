@@ -69,7 +69,7 @@ public:
         double max_dist_sq_fine = 4.0;
         double max_dist_sq_bbs_refine = 25.0;
         double max_gicp_error = 60000.0;
-        int max_gicp_failures = 5;
+        int max_gicp_failures = 6000;
         std::string voxel_dir = "";
 
         // Smoothing filter for T_map_odom to prevent localization_pose jumps
@@ -249,24 +249,33 @@ private:
         std::unique_lock<std::mutex> lock(data_mtx_);
         double cur_time = fins::to_seconds(acq_time);
 
-        // ================== 核心优化：精定位阶段限制触发频率 ==================
+        // 精定位阶段：累积 1s 点云后触发 GICP 配准
         if (state_ == SystemState::FINE_LOCALIZATION) {
+            // 刚从粗定位切换过来，开始计时累积
+            if (last_gicp_run_time_ < 0.0) {
+                last_gicp_run_time_ = cur_time;
+                accumulated_cloud_odom_->clear();
+            }
+
+            auto temp = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*cloud_odom_in, 0.2, config_.num_threads);
+            *accumulated_cloud_odom_ += *temp;
+
             double elapsed = cur_time - last_gicp_run_time_;
             if (elapsed >= config_.tracking_interval) {
                 if (!is_processing_job_) {
-                    job_.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(*cloud_odom_in));
+                    job_.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(*accumulated_cloud_odom_));
                     job_.ts = acq_time;
                     job_.T_odom_base = latest_T_odom_base_;
                     job_.has_new_job = true;
                     last_gicp_run_time_ = cur_time;
+                    accumulated_cloud_odom_->clear();
                     cv_.notify_one();
                 }
             }
             return; // 结束回调
         }
-        // =================================================================================
 
-        // 仅在粗定位（BBS）阶段进行 1.0 秒的点云累积
+        // 粗定位（BBS）阶段：累积 1.0 秒点云后触发 3dBBS 搜索
         if (!accumulation_started_) {
             accumulation_started_ = true;
             start_accumulation_time_ = cur_time;
@@ -352,6 +361,7 @@ private:
             small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
             reg.reduction.num_threads = config_.num_threads;
             reg.rejector.max_dist_sq = config_.max_dist_sq_bbs_refine; 
+            reg.optimizer.max_iterations = 20;
 
             auto t_refine_start = std::chrono::high_resolution_clock::now();
             auto res = reg.align(*target_covs_, *source_down, *target_tree_, T_map_base_bbs);
@@ -371,6 +381,9 @@ private:
                 has_filtered_pose_ = false;
                 state_ = SystemState::FINE_LOCALIZATION;
                 consecutive_gicp_failures_ = 0;
+                // 清空累积点云，为精定位阶段的 1s 累积做准备
+                accumulated_cloud_odom_->clear();
+                last_gicp_run_time_ = -1.0;  // 标记：等待首个点云到达时开始计时
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
@@ -397,6 +410,7 @@ private:
         small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
         reg.reduction.num_threads = config_.num_threads;
         reg.rejector.max_dist_sq = config_.max_dist_sq_fine; 
+        reg.optimizer.max_iterations = 20;
         
         // 4. 在 base_link 系下进行配准
         auto result = reg.align(*target_covs_, *source_down, *target_tree_, T_map_base_init);
