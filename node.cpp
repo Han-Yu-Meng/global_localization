@@ -75,6 +75,9 @@ public:
         // Smoothing filter for T_map_odom to prevent localization_pose jumps
         bool smooth_enabled = false;
         double smooth_alpha = 0.3;  // 0.0 = frozen, 1.0 = no smoothing
+
+        // Planar constraint: force roll, pitch, z = 0 for map->odom and localization_pose
+        bool planar_constraint = false;
     };
 
     struct JobData {
@@ -155,7 +158,10 @@ public:
         config_.smooth_alpha = config.get("smooth_alpha", 0.3)
                                     .with_description("Smoothing factor for EMA filter (0.0 = frozen, 1.0 = no smoothing). Lower = smoother but more lag.")
                                     .within(0.0, 1.0);
-        
+
+        config_.planar_constraint = config.get("planar_constraint", false)
+                                        .with_description("If true, force roll=0, pitch=0, z=0 on map->odom transform and current_pose output");
+
         bbs3d_ = std::make_unique<cpu::BBS3D>();
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
@@ -360,6 +366,7 @@ private:
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
                 T_map_odom_ = T_map_base_final * job.T_odom_base.inverse();
+                if (config_.planar_constraint) T_map_odom_ = apply_planar_constraint(T_map_odom_);
                 // 初始化平滑滤波器状态，使后续精定位从当前值开始平滑
                 has_filtered_pose_ = false;
                 state_ = SystemState::FINE_LOCALIZATION;
@@ -412,6 +419,7 @@ private:
                 // 5. 根据配准后的 T_map_base 更新 T_map_odom（原始值），然后应用平滑滤波
                 Eigen::Isometry3d T_map_odom_raw = result.T_target_source * job.T_odom_base.inverse();
                 T_map_odom_ = apply_smooth_filter(T_map_odom_raw);
+                if (config_.planar_constraint) T_map_odom_ = apply_planar_constraint(T_map_odom_);
                 consecutive_gicp_failures_ = 0;
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
@@ -472,6 +480,14 @@ private:
         return filtered;
     }
 
+    Eigen::Isometry3d apply_planar_constraint(const Eigen::Isometry3d& T) {
+        Eigen::Isometry3d result = T;
+        result.translation().z() = 0.0;
+        Eigen::Vector3d rpy = result.linear().eulerAngles(0, 1, 2);
+        result.linear() = Eigen::AngleAxisd(rpy.z(), Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        return result;
+    }
+
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
         geometry_msgs::msg::TransformStamped tf;
         tf.header.frame_id = "map";
@@ -501,6 +517,7 @@ private:
     void publish_current_pose(fins::AcqTime ts, const Eigen::Isometry3d& T_odom_base) {
         if (required("current_pose")) {
             Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
+            if (config_.planar_constraint) T_map_base = apply_planar_constraint(T_map_base);
             geometry_msgs::msg::PoseStamped pose;
             pose.header.frame_id = "map";
             pose.header.stamp = fins::to_ros_msg_time(ts); // Use the provided timestamp
