@@ -49,15 +49,16 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     struct Config {
-        Eigen::Vector3d min_search_xyz{-100.0, -100.0, -2.0};
-        Eigen::Vector3d max_search_xyz{100.0, 100.0, 2.0};
+        Eigen::Vector3d min_search_xyz{-10.0, -20.0, -0.05};
+        Eigen::Vector3d max_search_xyz{200.0, 500.0, 0.05};
         Eigen::Vector3d min_search_rpy{0.0, 0.0, -M_PI};
         Eigen::Vector3d max_search_rpy{0.0, 0.0, M_PI};
         
         int num_threads = 8;
         double score_threshold = 0.3;
         double accumulation_time = 1.0;
-        
+        double tracking_interval = 1.0;
+
         double min_level_res = 1.5;
         int max_level = 5;
         double global_leaf_size = 0.8;
@@ -68,8 +69,15 @@ public:
         double max_dist_sq_fine = 4.0;
         double max_dist_sq_bbs_refine = 25.0;
         double max_gicp_error = 60000.0;
-        int max_gicp_failures = 5;
+        int max_gicp_failures = 6000;
         std::string voxel_dir = "";
+
+        // Smoothing filter for T_map_odom to prevent localization_pose jumps
+        bool smooth_enabled = false;
+        double smooth_alpha = 0.3;  // 0.0 = frozen, 1.0 = no smoothing
+
+        // Planar constraint: force roll, pitch, z = 0 for map->odom and localization_pose
+        bool planar_constraint = false;
     };
 
     struct JobData {
@@ -105,7 +113,11 @@ public:
         config_.accumulation_time = config.get("accumulation_time", 1.0)
                                     .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
                                     .greater_than(0.0);
-                                    
+
+        config_.tracking_interval = config.get("tracking_interval", 1.0)
+                                    .with_description("Time interval between GICP tracking updates (seconds)")
+                                    .greater_than(0.0);
+
         config_.min_level_res = config.get("min_level_res", 1.5)
                                     .with_description("Resolution of the lowest level in the 3dBBS multi-resolution pyramid (meters)")
                                     .greater_than(0.0);
@@ -139,7 +151,17 @@ public:
         
         config_.voxel_dir = config.get("voxel_dir", std::string(""))
                                   .with_description("Directory path for storing preprocessed voxel maps");
-        
+
+        config_.smooth_enabled = config.get("smooth_enabled", false)
+                                     .with_description("Enable EMA smoothing filter on T_map_odom to prevent localization_pose jumps");
+
+        config_.smooth_alpha = config.get("smooth_alpha", 0.3)
+                                    .with_description("Smoothing factor for EMA filter (0.0 = frozen, 1.0 = no smoothing). Lower = smoother but more lag.")
+                                    .within(0.0, 1.0);
+
+        config_.planar_constraint = config.get("planar_constraint", false)
+                                        .with_description("If true, force roll=0, pitch=0, z=0 on map->odom transform and current_pose output");
+
         bbs3d_ = std::make_unique<cpu::BBS3D>();
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
@@ -166,6 +188,7 @@ public:
         accumulated_cloud_odom_->clear();
         accumulation_started_ = false;
         consecutive_gicp_failures_ = 0;
+        has_filtered_pose_ = false;
     }
 
     ~GlobalLocalizationNode() {
@@ -226,6 +249,33 @@ private:
         std::unique_lock<std::mutex> lock(data_mtx_);
         double cur_time = fins::to_seconds(acq_time);
 
+        // 精定位阶段：累积 1s 点云后触发 GICP 配准
+        if (state_ == SystemState::FINE_LOCALIZATION) {
+            // 刚从粗定位切换过来，开始计时累积
+            if (last_gicp_run_time_ < 0.0) {
+                last_gicp_run_time_ = cur_time;
+                accumulated_cloud_odom_->clear();
+            }
+
+            auto temp = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointXYZI>>(*cloud_odom_in, 0.2, config_.num_threads);
+            *accumulated_cloud_odom_ += *temp;
+
+            double elapsed = cur_time - last_gicp_run_time_;
+            if (elapsed >= config_.tracking_interval) {
+                if (!is_processing_job_) {
+                    job_.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(*accumulated_cloud_odom_));
+                    job_.ts = acq_time;
+                    job_.T_odom_base = latest_T_odom_base_;
+                    job_.has_new_job = true;
+                    last_gicp_run_time_ = cur_time;
+                    accumulated_cloud_odom_->clear();
+                    cv_.notify_one();
+                }
+            }
+            return; // 结束回调
+        }
+
+        // 粗定位（BBS）阶段：累积 1.0 秒点云后触发 3dBBS 搜索
         if (!accumulation_started_) {
             accumulation_started_ = true;
             start_accumulation_time_ = cur_time;
@@ -246,7 +296,6 @@ private:
             accumulation_started_ = false;
         }
     }
-
     void worker_loop() {
         while (is_worker_running_) {
             JobData current_job;
@@ -312,6 +361,7 @@ private:
             small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
             reg.reduction.num_threads = config_.num_threads;
             reg.rejector.max_dist_sq = config_.max_dist_sq_bbs_refine; 
+            reg.optimizer.max_iterations = 20;
 
             auto t_refine_start = std::chrono::high_resolution_clock::now();
             auto res = reg.align(*target_covs_, *source_down, *target_tree_, T_map_base_bbs);
@@ -326,8 +376,14 @@ private:
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
                 T_map_odom_ = T_map_base_final * job.T_odom_base.inverse();
+                if (config_.planar_constraint) T_map_odom_ = apply_planar_constraint(T_map_odom_);
+                // 初始化平滑滤波器状态，使后续精定位从当前值开始平滑
+                has_filtered_pose_ = false;
                 state_ = SystemState::FINE_LOCALIZATION;
                 consecutive_gicp_failures_ = 0;
+                // 清空累积点云，为精定位阶段的 1s 累积做准备
+                accumulated_cloud_odom_->clear();
+                last_gicp_run_time_ = -1.0;  // 标记：等待首个点云到达时开始计时
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
@@ -338,40 +394,53 @@ private:
     void perform_fine_tracking(const JobData& job) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
+        // 1. 将 Odom 系下的累积点云转换到当前 base_link 坐标系下
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_base(new pcl::PointCloud<pcl::PointXYZI>());
+        pcl::transformPointCloud(*job.cloud_odom, *cloud_base, job.T_odom_base.inverse().matrix().cast<float>());
+
+        // 2. 对 base_link 系下的点云进行下采样
         pcl::PointCloud<pcl::PointCovariance>::Ptr source_down = small_gicp::voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZI>, pcl::PointCloud<pcl::PointCovariance>>(
-            *job.cloud_odom, config_.registered_leaf_size, config_.num_threads);
+            *cloud_base, config_.registered_leaf_size, config_.num_threads);
         
         small_gicp::estimate_covariances_omp(*source_down, 20, config_.num_threads);
+
+        // 3. 计算基于里程计预测的 T_map_base 初始估计
+        Eigen::Isometry3d T_map_base_init = T_map_odom_ * job.T_odom_base;
 
         small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
         reg.reduction.num_threads = config_.num_threads;
         reg.rejector.max_dist_sq = config_.max_dist_sq_fine; 
+        reg.optimizer.max_iterations = 20;
         
-        auto result = reg.align(*target_covs_, *source_down, *target_tree_, T_map_odom_);
+        // 4. 在 base_link 系下进行配准
+        auto result = reg.align(*target_covs_, *source_down, *target_tree_, T_map_base_init);
         
         auto t_end = std::chrono::high_resolution_clock::now();
         double duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
         if (result.converged && result.error < config_.max_gicp_error) {
-            Eigen::Isometry3d T_delta = result.T_target_source * T_map_odom_.inverse();
+            Eigen::Isometry3d T_delta = result.T_target_source * T_map_base_init.inverse();
             Eigen::Vector3d t_diff = T_delta.translation();
             Eigen::Vector3d rpy_diff = T_delta.linear().eulerAngles(0, 1, 2) * 180.0 / M_PI;
 
             logger->info("[GICP] Result: converged={}, error={:.2f}, iter={}, time={:.2f}ms | Delta: xyz[{:.3f} {:.3f} {:.3f}] rpy[{:.3f} {:.3f} {:.3f} deg]",
-                         result.converged, result.error, result.iterations, duration_ms,
-                         t_diff.x(), t_diff.y(), t_diff.z(),
-                         rpy_diff.x(), rpy_diff.y(), rpy_diff.z());
+                        result.converged, result.error, result.iterations, duration_ms,
+                        t_diff.x(), t_diff.y(), t_diff.z(),
+                        rpy_diff.x(), rpy_diff.y(), rpy_diff.z());
 
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
-                T_map_odom_ = result.T_target_source;
+                // 5. 根据配准后的 T_map_base 更新 T_map_odom（原始值），然后应用平滑滤波
+                Eigen::Isometry3d T_map_odom_raw = result.T_target_source * job.T_odom_base.inverse();
+                T_map_odom_ = apply_smooth_filter(T_map_odom_raw);
+                if (config_.planar_constraint) T_map_odom_ = apply_planar_constraint(T_map_odom_);
                 consecutive_gicp_failures_ = 0;
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
             consecutive_gicp_failures_++;
             logger->warn("[GICP] Tracking Failed (converged={}, error={:.2f}). consecutive: {}", 
-                         result.converged, result.error, consecutive_gicp_failures_);
+                        result.converged, result.error, consecutive_gicp_failures_);
             if (consecutive_gicp_failures_ >= config_.max_gicp_failures) {
                 logger->error("[GICP] Too many failures, Resetting to COARSE.");
                 state_ = SystemState::COARSE_LOCALIZATION;
@@ -379,7 +448,59 @@ private:
         }
     }
 
+    Eigen::Isometry3d apply_smooth_filter(const Eigen::Isometry3d& raw_T_map_odom) {
+        if (!config_.smooth_enabled) {
+            return raw_T_map_odom;
+        }
 
+        if (!has_filtered_pose_) {
+            T_map_odom_filtered_ = raw_T_map_odom;
+            has_filtered_pose_ = true;
+            return raw_T_map_odom;
+        }
+
+        // Extract translation and rotation from previous filtered pose
+        Eigen::Vector3d t_prev = T_map_odom_filtered_.translation();
+        Eigen::Quaterniond q_prev(T_map_odom_filtered_.rotation());
+        q_prev.normalize();
+
+        // Extract translation and rotation from new raw pose
+        Eigen::Vector3d t_raw = raw_T_map_odom.translation();
+        Eigen::Quaterniond q_raw(raw_T_map_odom.rotation());
+        q_raw.normalize();
+
+        // EMA for translation: linear interpolation
+        Eigen::Vector3d t_smooth = config_.smooth_alpha * t_raw + (1.0 - config_.smooth_alpha) * t_prev;
+
+        // EMA for rotation: spherical linear interpolation (slerp)
+        Eigen::Quaterniond q_smooth = q_prev.slerp(config_.smooth_alpha, q_raw);
+        q_smooth.normalize();
+
+        // Build filtered pose
+        Eigen::Isometry3d filtered = Eigen::Isometry3d::Identity();
+        filtered.translation() = t_smooth;
+        filtered.linear() = q_smooth.toRotationMatrix();
+
+        T_map_odom_filtered_ = filtered;
+
+        double trans_delta = (t_raw - t_prev).norm();
+        double rot_delta = q_prev.angularDistance(q_raw) * 180.0 / M_PI;
+        logger->debug("[Smooth] Raw delta: trans={:.3f}m rot={:.2f}deg | Filtered delta: trans={:.3f}m rot={:.2f}deg | alpha={:.2f}",
+                      trans_delta, rot_delta,
+                      (t_smooth - t_prev).norm(),
+                      q_prev.angularDistance(q_smooth) * 180.0 / M_PI,
+                      config_.smooth_alpha);
+
+        return filtered;
+    }
+
+    Eigen::Isometry3d apply_planar_constraint(const Eigen::Isometry3d& T) {
+        Eigen::Isometry3d result = T;
+        result.translation().z() = 0.0;
+        Eigen::Vector3d rpy = result.linear().eulerAngles(0, 1, 2);
+        result.linear() = Eigen::AngleAxisd(rpy.z(), Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        return result;
+    }
 
     void publish_results(fins::AcqTime ts, const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom, const Eigen::Isometry3d& T_odom_base) {
     /*
@@ -431,6 +552,7 @@ private:
         
         if (required("current_pose")) {
             Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
+            if (config_.planar_constraint) T_map_base = apply_planar_constraint(T_map_base);
             geometry_msgs::msg::PoseStamped pose;
             pose.header.frame_id = "map";
             pose.header.stamp = fins::to_ros_msg_time(ts); // Use the provided timestamp
@@ -457,10 +579,15 @@ private:
     
     Eigen::Isometry3d T_map_odom_{Eigen::Isometry3d::Identity()};
     Eigen::Isometry3d latest_T_odom_base_{Eigen::Isometry3d::Identity()};
+
+    // Smoothing filter state
+    bool has_filtered_pose_{false};
+    Eigen::Isometry3d T_map_odom_filtered_{Eigen::Isometry3d::Identity()};
     
     int consecutive_gicp_failures_ = 0;
     bool accumulation_started_ = false;
     double start_accumulation_time_ = 0.0;
+    double last_gicp_run_time_ = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr accumulated_cloud_odom_;
 
     JobData job_;

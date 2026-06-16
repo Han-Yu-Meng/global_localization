@@ -17,6 +17,7 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
 )
 
+# 1. 定义 cpu_bbs3d 静态库
 add_library(cpu_bbs3d
   STATIC
   bbs3d/src/cpu_bbs3d/bbs3d.cpp
@@ -32,6 +33,15 @@ target_link_libraries(cpu_bbs3d
   OpenMP::OpenMP_CXX
 )
 
+# 2. 【关键修正】为 cpu_bbs3d 静态库应用最高级别的 CPU 优化选项和硬件矢量化
+target_compile_options(cpu_bbs3d PRIVATE
+  -O3
+  -ffast-math
+  -DNDEBUG
+  -march=native  # 允许编译器利用当前编译机器支持的所有 CPU 特性（AVX2, AVX512, SSE4 等）
+)
+
+# 3. 定义并编译 ROS 节点
 fins_add_node(${PROJECT_NAME}
   node.cpp
 )
@@ -42,8 +52,11 @@ fins_link_ros_dependencies(${PROJECT_NAME}
   tf2_eigen
 )
 
+# 4. 【关键修正】同样为节点目标应用最高级别优化和矢量化
 target_compile_options(${PROJECT_NAME} PRIVATE
-  -O3 -ffast-math -DNDEBUG
+  -O3
+  -ffast-math
+  -DNDEBUG
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
