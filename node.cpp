@@ -76,6 +76,9 @@ public:
         bool smooth_enabled = false;
         double smooth_alpha = 0.3;  // 0.0 = frozen, 1.0 = no smoothing
 
+        // Pose publish trigger: "tf" = every odom callback, "gicp" = only when GICP updates T_map_odom
+        std::string pose_trigger = "tf";
+
         // Planar constraint: force roll, pitch, z = 0 for map->odom and localization_pose
         bool planar_constraint = false;
     };
@@ -159,6 +162,9 @@ public:
                                     .with_description("Smoothing factor for EMA filter (0.0 = frozen, 1.0 = no smoothing). Lower = smoother but more lag.")
                                     .within(0.0, 1.0);
 
+        config_.pose_trigger = config.get("pose_trigger", std::string("tf"))
+                                     .with_description("Pose publish trigger: 'tf' = every odom callback, 'gicp' = only on GICP update");
+
         config_.planar_constraint = config.get("planar_constraint", false)
                                         .with_description("If true, force roll=0, pitch=0, z=0 on map->odom transform and current_pose output");
 
@@ -238,7 +244,7 @@ private:
         latest_T_odom_base_ = tf2::transformToEigen(*msg);
         tf_received_ = true;
 
-        if (map_ready_ && state_ != SystemState::IDLE) {
+        if (map_ready_ && state_ != SystemState::IDLE && config_.pose_trigger == "tf") {
             publish_current_pose(msg.acq_time, latest_T_odom_base_);
         }
     }
@@ -384,6 +390,9 @@ private:
                 // 清空累积点云，为精定位阶段的 1s 累积做准备
                 accumulated_cloud_odom_->clear();
                 last_gicp_run_time_ = -1.0;  // 标记：等待首个点云到达时开始计时
+                if (config_.pose_trigger == "gicp") {
+                    publish_current_pose(job.ts, job.T_odom_base);
+                }
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
@@ -435,6 +444,9 @@ private:
                 T_map_odom_ = apply_smooth_filter(T_map_odom_raw);
                 if (config_.planar_constraint) T_map_odom_ = apply_planar_constraint(T_map_odom_);
                 consecutive_gicp_failures_ = 0;
+                if (config_.pose_trigger == "gicp") {
+                    publish_current_pose(job.ts, job.T_odom_base);
+                }
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
