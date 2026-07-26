@@ -7,7 +7,7 @@
 #include <fins/node.hpp>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 
 #if __has_include(<tf2_eigen/tf2_eigen.hpp>)
   #include <tf2_eigen/tf2_eigen.hpp>
@@ -95,11 +95,11 @@ public:
         set_category("Navigation>Localization");
         register_input<pcl::PointCloud<pcl::PointXYZI>::Ptr>("cloud", &GlobalLocalizationNode::on_cloud_callback);
         register_input<geometry_msgs::msg::TransformStamped>("$T_{odom}^{baselink}$", &GlobalLocalizationNode::on_odom_tf_callback);
-
         register_output<pcl::PointCloud<pcl::PointXYZI>::Ptr>("global_map_viz");
         register_output<pcl::PointCloud<pcl::PointXYZI>::Ptr>("aligned_cloud");
         register_output<geometry_msgs::msg::TransformStamped>("$T_{map}^{odom}$");
-        register_output<geometry_msgs::msg::PoseStamped>("current_pose");
+        register_output<geometry_msgs::msg::PoseWithCovarianceStamped>("current_pose");
+        register_output<geometry_msgs::msg::PoseWithCovarianceStamped>("initial_pose");
     }
 
     void initialize() override {
@@ -393,6 +393,7 @@ private:
                 if (config_.pose_trigger == "gicp") {
                     publish_current_pose(job.ts, job.T_odom_base);
                 }
+                publish_initial_pose(job.ts, job.T_odom_base);
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
@@ -565,23 +566,51 @@ private:
         if (required("current_pose")) {
             Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
             if (config_.planar_constraint) T_map_base = apply_planar_constraint(T_map_base);
-            geometry_msgs::msg::PoseStamped pose;
+            geometry_msgs::msg::PoseWithCovarianceStamped pose;
             pose.header.frame_id = "map";
             pose.header.stamp = fins::to_ros_msg_time(ts); // Use the provided timestamp
-            
+
             Eigen::Vector3d t_base = T_map_base.translation();
             Eigen::Quaterniond q_base(T_map_base.rotation());
-            
-            pose.pose.position.x = t_base.x();
-            pose.pose.position.y = t_base.y();
-            pose.pose.position.z = t_base.z();
-            pose.pose.orientation.w = q_base.w();
-            pose.pose.orientation.x = q_base.x();
-            pose.pose.orientation.y = q_base.y();
-            pose.pose.orientation.z = q_base.z();
-            
+
+            pose.pose.pose.position.x = t_base.x();
+            pose.pose.pose.position.y = t_base.y();
+            pose.pose.pose.position.z = t_base.z();
+            pose.pose.pose.orientation.w = q_base.w();
+            pose.pose.pose.orientation.x = q_base.x();
+            pose.pose.pose.orientation.y = q_base.y();
+            pose.pose.pose.orientation.z = q_base.z();
+
+            // Covariance all zeros
+            for (int i = 0; i < 36; i++) pose.pose.covariance[i] = 0.0;
+
             send("current_pose", pose, ts);
         }
+    }
+
+    void publish_initial_pose(fins::AcqTime ts, const Eigen::Isometry3d& T_odom_base) {
+        if (!required("initial_pose")) return;
+
+        Eigen::Isometry3d T_map_base = T_map_odom_ * T_odom_base;
+        if (config_.planar_constraint) T_map_base = apply_planar_constraint(T_map_base);
+        geometry_msgs::msg::PoseWithCovarianceStamped pose;
+        pose.header.frame_id = "map";
+        pose.header.stamp = fins::to_ros_msg_time(ts);
+
+        Eigen::Vector3d t_base = T_map_base.translation();
+        Eigen::Quaterniond q_base(T_map_base.rotation());
+
+        pose.pose.pose.position.x = t_base.x();
+        pose.pose.pose.position.y = t_base.y();
+        pose.pose.pose.position.z = t_base.z();
+        pose.pose.pose.orientation.w = q_base.w();
+        pose.pose.pose.orientation.x = q_base.x();
+        pose.pose.pose.orientation.y = q_base.y();
+        pose.pose.pose.orientation.z = q_base.z();
+
+        for (int i = 0; i < 36; i++) pose.pose.covariance[i] = 0.0;
+
+        send("initial_pose", pose, ts);
     }
 
     Config config_;
