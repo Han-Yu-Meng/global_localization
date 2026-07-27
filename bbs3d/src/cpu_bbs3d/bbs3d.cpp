@@ -302,7 +302,7 @@ void BBS3D::localize() {
     best_score = best_trans.score;
 
     double score_1st = static_cast<double>(best_score);
-    double absolute_score_ratio = (src_points_.size() > 0) ? score_1st / src_points_.size() : 0.0;
+    double absolute_score_ratio = (src_points_.size() > 0) ? score_1st / (2.0 * src_points_.size()) : 0.0;
 
     if (top_candidates_.size() > 1) {
       double score_2nd = static_cast<double>(top_candidates_[1].score);

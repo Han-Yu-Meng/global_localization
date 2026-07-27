@@ -678,7 +678,7 @@ private:
             Eigen::Quaterniond q(T.linear());
 
             double score_ratio = (bbs3d_->get_src_points().size() > 0)
-                ? static_cast<double>(cand.score) / bbs3d_->get_src_points().size()
+                ? static_cast<double>(cand.score) / (2.0 * bbs3d_->get_src_points().size())
                 : 0.0;
 
             // Arrow marker pointing along yaw direction
