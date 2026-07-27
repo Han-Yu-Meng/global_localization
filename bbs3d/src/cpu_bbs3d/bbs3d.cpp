@@ -149,6 +149,7 @@ void BBS3D::calc_score(
     const Eigen::Vector3i coord = (transed_point.array() * inv_res).floor().cast<int>();
     const std::uint32_t hash = (coord[0] * 73856093) ^ (coord[1] * 19349669) ^ (coord[2] * 83492791);
 
+    bool found = false;
     for (int j = 0; j < max_bucket_scan_count; j++) {
       const std::uint32_t bucket_index = (hash + j) % num_buckets;
       const Eigen::Vector4i& bucket = buckets[bucket_index];
@@ -156,13 +157,19 @@ void BBS3D::calc_score(
       if (bucket.w() == 0) {
         break;
       }
-      
+
       if (bucket.x() != coord.x() || bucket.y() != coord.y() || bucket.z() != coord.z()) {
         continue;
       }
 
       trans.score += bucket.w();  // weighted: core=2, neighbor=1
+      found = true;
       break;
+    }
+
+    // Penalize points that fall outside the known map
+    if (!found) {
+      trans.score -= 0;
     }
   }
 }
@@ -195,9 +202,9 @@ void BBS3D::localize() {
   const auto time_limit = start_time + timeout_duration_;
   has_timed_out_ = false;
 
-  best_score_ = 0;
-  const int score_threshold = std::floor(src_points_.size() * score_threshold_percentage_);
-  int best_score = score_threshold;
+  best_score_ = 0.0;
+  const double score_threshold = std::floor(src_points_.size() * score_threshold_percentage_);
+  double best_score = score_threshold;
   DiscreteTransformation<double> best_trans(best_score);
 
   // Clear multi-peak candidates and confidence from previous run
@@ -301,11 +308,11 @@ void BBS3D::localize() {
     best_trans = top_candidates_[0];
     best_score = best_trans.score;
 
-    double score_1st = static_cast<double>(best_score);
+    double score_1st = best_score;
     double absolute_score_ratio = (src_points_.size() > 0) ? score_1st / (2.0 * src_points_.size()) : 0.0;
 
     if (top_candidates_.size() > 1) {
-      double score_2nd = static_cast<double>(top_candidates_[1].score);
+      double score_2nd = top_candidates_[1].score;
       // Margin: 1.0 = highly unimodal, 0.0 = equally strong competing peaks
       peak_margin_ = (score_1st - score_2nd) / score_1st;
     } else {

@@ -68,7 +68,7 @@ public:
 
   Eigen::Matrix4d get_global_pose() const { return global_pose_; }
 
-  int get_best_score() const { return best_score_; }
+  double get_best_score() const { return best_score_; }
 
   double get_elapsed_time() const { return elapsed_time_; }
 
@@ -138,7 +138,7 @@ private:
   double inv_v_rate_;
   int num_threads_;
 
-  int best_score_;
+  double best_score_;
   double score_threshold_percentage_;
   bool use_timeout_;
   std::chrono::milliseconds timeout_duration_;
