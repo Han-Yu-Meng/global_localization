@@ -161,10 +161,32 @@ void BBS3D::calc_score(
         continue;
       }
 
-      trans.score++;
+      trans.score += bucket.w();  // weighted: core=2, neighbor=1
       break;
     }
   }
+}
+
+bool BBS3D::is_spatially_distinct(
+  const DiscreteTransformation<double>& a,
+  const DiscreteTransformation<double>& b,
+  double trans_res,
+  const Eigen::Vector3d& rpy_res) const {
+  // Translation distance squared
+  double dx = (a.x - b.x) * trans_res;
+  double dy = (a.y - b.y) * trans_res;
+  double dz = (a.z - b.z) * trans_res;
+  double dist_sq = dx * dx + dy * dy + dz * dz;
+  if (dist_sq > nms_dist_thresh_sq_) return true;
+
+  // Angular difference (primary check on yaw for planar robot)
+  double droll = std::abs(a.roll - b.roll) * rpy_res.x();
+  double dpitch = std::abs(a.pitch - b.pitch) * rpy_res.y();
+  double dyaw = std::abs(a.yaw - b.yaw) * rpy_res.z();
+  if (droll > nms_angle_thresh_rad_ || dpitch > nms_angle_thresh_rad_ || dyaw > nms_angle_thresh_rad_)
+    return true;
+
+  return false;
 }
 
 void BBS3D::localize() {
@@ -178,11 +200,18 @@ void BBS3D::localize() {
   int best_score = score_threshold;
   DiscreteTransformation<double> best_trans(best_score);
 
+  // Clear multi-peak candidates and confidence from previous run
+  top_candidates_.clear();
+  confidence_score_ = 0.0;
+  peak_margin_ = 0.0;
+  const int max_candidates = 3;
+
   // Preapre initial transset
   const int max_bucket_scan_count = voxelmaps_ptr_->get_max_bucket_scan_count();
   const int max_level = voxelmaps_ptr_->get_max_level();
   std::vector<AngularInfo> ang_info_vec(max_level + 1);
   calc_angular_info(ang_info_vec);
+  leaf_ang_info_ = ang_info_vec[0];  // Store for external pose reconstruction
   auto init_transset = create_init_transset(ang_info_vec[max_level]);
 
   // Calc initial transset scores
@@ -212,8 +241,31 @@ void BBS3D::localize() {
     }
 
     if (trans.is_leaf()) {
-      best_trans = trans;
-      best_score = trans.score;
+      // Multi-peak NMS: collect spatially distinct leaf candidates
+      if (top_candidates_.empty()) {
+        // First candidate is the best (highest-scoring leaf processed first)
+        best_trans = trans;
+        best_score = trans.score;
+        top_candidates_.push_back(trans);
+      } else {
+        // Check spatial distinctness against already-collected candidates
+        double min_res = voxelmaps_ptr_->get_min_res();
+        bool is_distinct = true;
+        for (const auto& cand : top_candidates_) {
+          if (!is_spatially_distinct(trans, cand, min_res, ang_info_vec[0].rpy_res)) {
+            is_distinct = false;
+            break;
+          }
+        }
+        if (is_distinct) {
+          top_candidates_.push_back(trans);
+        }
+      }
+
+      // Early exit: collected enough spatially distinct candidates
+      if (top_candidates_.size() >= max_candidates) {
+        break;
+      }
     } else {
       const int child_level = trans.level - 1;
       const Eigen::Vector3i& num_division = ang_info_vec[child_level].num_division;
@@ -244,8 +296,28 @@ void BBS3D::localize() {
   const auto end_time = std::chrono::system_clock::now();
   elapsed_time_ = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count() / 1e6;
 
+  // Confidence evaluation
+  if (!top_candidates_.empty()) {
+    best_trans = top_candidates_[0];
+    best_score = best_trans.score;
+
+    double score_1st = static_cast<double>(best_score);
+    double absolute_score_ratio = (src_points_.size() > 0) ? score_1st / src_points_.size() : 0.0;
+
+    if (top_candidates_.size() > 1) {
+      double score_2nd = static_cast<double>(top_candidates_[1].score);
+      // Margin: 1.0 = highly unimodal, 0.0 = equally strong competing peaks
+      peak_margin_ = (score_1st - score_2nd) / score_1st;
+    } else {
+      peak_margin_ = 1.0;  // No competing peak found
+    }
+
+    // Confidence: blend of peak separation and absolute match quality
+    confidence_score_ = 0.6 * peak_margin_ + 0.4 * absolute_score_ratio;
+  }
+
   // Not localized
-  if (best_score == score_threshold || has_timed_out_) {
+  if (best_score == score_threshold || has_timed_out_ || top_candidates_.empty()) {
     has_localized_ = false;
     return;
   }

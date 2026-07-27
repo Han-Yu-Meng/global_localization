@@ -50,6 +50,7 @@ fins_link_ros_dependencies(${PROJECT_NAME}
   geometry_msgs
   nav_msgs
   tf2_eigen
+  visualization_msgs
 )
 
 # 4. 【关键修正】同样为节点目标应用最高级别优化和矢量化

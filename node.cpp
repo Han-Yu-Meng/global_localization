@@ -34,11 +34,16 @@
 // 3dBBS
 #include <cpu_bbs3d/bbs3d.hpp>
 
+#include <visualization_msgs/msg/marker_array.hpp>
+
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <filesystem>
 #include <atomic>
+#include <sstream>
+#include <iomanip>
+#include <array>
 
 namespace fs = std::filesystem;
 
@@ -81,6 +86,10 @@ public:
 
         // Planar constraint: force roll, pitch, z = 0 for map->odom and localization_pose
         bool planar_constraint = false;
+
+        // NMS and confidence evaluation thresholds
+        double nms_dist_thresh = 2.0;       // meters
+        double nms_angle_thresh_deg = 30.0;  // degrees
     };
 
     struct JobData {
@@ -100,6 +109,7 @@ public:
         register_output<geometry_msgs::msg::TransformStamped>("$T_{map}^{odom}$");
         register_output<geometry_msgs::msg::PoseWithCovarianceStamped>("current_pose");
         register_output<geometry_msgs::msg::PoseWithCovarianceStamped>("initial_pose");
+        register_output<visualization_msgs::msg::MarkerArray>("bbs_candidates");
     }
 
     void initialize() override {
@@ -168,6 +178,14 @@ public:
         config_.planar_constraint = config.get("planar_constraint", false)
                                         .with_description("If true, force roll=0, pitch=0, z=0 on map->odom transform and current_pose output");
 
+        config_.nms_dist_thresh = config.get("nms_dist_thresh", 2.0)
+                                       .with_description("Minimum distance (m) between distinct BBS candidate peaks for NMS")
+                                       .greater_than(0.0);
+
+        config_.nms_angle_thresh_deg = config.get("nms_angle_thresh_deg", 30.0)
+                                             .with_description("Minimum yaw difference (deg) between distinct BBS candidate peaks for NMS")
+                                             .within(0.0, 180.0);
+
         bbs3d_ = std::make_unique<cpu::BBS3D>();
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
@@ -226,6 +244,7 @@ private:
         for (auto& p : map_algo->points) tar_points.push_back(p.getVector3fMap().cast<double>());
         bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
         bbs3d_->set_score_threshold_percentage(config_.score_threshold);
+        bbs3d_->set_nms_thresholds(config_.nms_dist_thresh, config_.nms_angle_thresh_deg);
         bbs3d_->set_num_threads(16);
 
         map_ready_ = true;
@@ -351,10 +370,20 @@ private:
         double duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
         if (bbs3d_->has_localized()) {
-            logger->info("[3dBBS] Localized! Score: {} ({:.2f}%), Time: {:.2f}ms", 
-                         bbs3d_->get_best_score(), 
-                         bbs3d_->get_best_score_percentage() * 100.0, 
+            logger->info("[3dBBS] Localized! Score: {} ({:.2f}%), Time: {:.2f}ms",
+                         bbs3d_->get_best_score(),
+                         bbs3d_->get_best_score_percentage() * 100.0,
                          duration_ms);
+
+            // Log confidence evaluation
+            double confidence = bbs3d_->get_confidence_score();
+            double peak_margin = bbs3d_->get_peak_margin();
+            size_t num_candidates = bbs3d_->get_top_candidates().size();
+            logger->info("[3dBBS] Confidence={:.3f}, PeakMargin={:.3f}, TopK={}",
+                         confidence, peak_margin, num_candidates);
+
+            // Publish candidate visualization markers
+            publish_bbs_candidates(job.ts);
 
             Eigen::Isometry3d T_map_base_bbs(bbs3d_->get_global_pose());
             T_map_base_bbs.linear() = Eigen::Quaterniond(T_map_base_bbs.linear()).normalized().toRotationMatrix();
@@ -611,6 +640,101 @@ private:
         for (int i = 0; i < 36; i++) pose.pose.covariance[i] = 0.0;
 
         send("initial_pose", pose, ts);
+    }
+
+    void publish_bbs_candidates(fins::AcqTime ts) {
+        if (!required("bbs_candidates")) return;
+        if (!bbs3d_->has_localized()) return;
+
+        auto candidates = bbs3d_->get_top_candidates();
+        if (candidates.empty()) return;
+
+        visualization_msgs::msg::MarkerArray marker_array;
+        auto ros_time = fins::to_ros_msg_time(ts);
+
+        // Leaf-level resolution for converting discrete transforms to continuous poses
+        double min_res = config_.min_level_res;
+        cpu::AngularInfo leaf_ang = bbs3d_->get_leaf_angular_info();
+
+        // Color scheme: green (best), yellow (2nd), orange (3rd)
+        const std::array<std::array<double, 4>, 3> colors = {{
+            {0.0, 1.0, 0.0, 1.0},       // Green
+            {1.0, 0.8, 0.0, 0.9},       // Yellow-orange
+            {1.0, 0.4, 0.0, 0.7},       // Orange, semi-transparent
+        }};
+
+        int marker_id = 0;
+        for (size_t i = 0; i < candidates.size() && i < 3; ++i) {
+            const auto& cand = candidates[i];
+            const auto& color = colors[i];
+
+            // Convert discrete transform to continuous 4x4 pose matrix
+            Eigen::Matrix4d pose_matrix = cand.create_matrix(
+                min_res, leaf_ang.rpy_res, leaf_ang.min_rpy);
+            Eigen::Isometry3d T(pose_matrix);
+            T.linear() = Eigen::Quaterniond(T.linear()).normalized().toRotationMatrix();
+
+            Eigen::Vector3d pos = T.translation();
+            Eigen::Quaterniond q(T.linear());
+
+            double score_ratio = (bbs3d_->get_src_points().size() > 0)
+                ? static_cast<double>(cand.score) / bbs3d_->get_src_points().size()
+                : 0.0;
+
+            // Arrow marker pointing along yaw direction
+            {
+                visualization_msgs::msg::Marker arrow;
+                arrow.header.frame_id = "map";
+                arrow.header.stamp = ros_time;
+                arrow.ns = "bbs_candidates_arrow";
+                arrow.id = marker_id++;
+                arrow.type = visualization_msgs::msg::Marker::ARROW;
+                arrow.action = visualization_msgs::msg::Marker::ADD;
+                arrow.pose.position.x = pos.x();
+                arrow.pose.position.y = pos.y();
+                arrow.pose.position.z = pos.z();
+                arrow.pose.orientation.w = q.w();
+                arrow.pose.orientation.x = q.x();
+                arrow.pose.orientation.y = q.y();
+                arrow.pose.orientation.z = q.z();
+                // Scale: shaft diameter, head diameter, shaft length
+                double shaft_len = 1.5 + 1.0 * score_ratio;
+                arrow.scale.x = 0.12;     // shaft diameter
+                arrow.scale.y = 0.22;     // head diameter
+                arrow.scale.z = shaft_len;
+                arrow.color.r = color[0];
+                arrow.color.g = color[1];
+                arrow.color.b = color[2];
+                arrow.color.a = color[3];
+                marker_array.markers.push_back(arrow);
+            }
+
+            // Text marker with rank and score
+            {
+                visualization_msgs::msg::Marker text;
+                text.header.frame_id = "map";
+                text.header.stamp = ros_time;
+                text.ns = "bbs_candidates_text";
+                text.id = marker_id++;
+                text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+                text.action = visualization_msgs::msg::Marker::ADD;
+                text.pose.position.x = pos.x();
+                text.pose.position.y = pos.y();
+                text.pose.position.z = pos.z() + 0.6;
+                text.scale.z = 0.35;  // text height
+                text.color.r = color[0];
+                text.color.g = color[1];
+                text.color.b = color[2];
+                text.color.a = color[3];
+                std::ostringstream oss;
+                oss << "#" << (i + 1) << ": " << std::fixed << std::setprecision(1)
+                    << (score_ratio * 100.0) << "%";
+                text.text = oss.str();
+                marker_array.markers.push_back(text);
+            }
+        }
+
+        send("bbs_candidates", marker_array, ts);
     }
 
     Config config_;

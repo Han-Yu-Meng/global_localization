@@ -47,6 +47,10 @@ private:
 
   Buckets create_hash_buckets(const UnorderedVoxelMap& unordered_voxelmap);
 
+  Buckets create_hash_buckets_weighted(const UnorderedVoxelMap& unordered_voxelmap);
+
+  UnorderedVoxelMap max_pool_voxel_map(const UnorderedVoxelMap& fine_map, int v_rate);
+
 public:
   std::vector<Buckets> multi_buckets_;
 

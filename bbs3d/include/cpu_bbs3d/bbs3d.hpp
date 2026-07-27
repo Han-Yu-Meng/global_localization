@@ -18,6 +18,11 @@ struct AngularInfo {
   Eigen::Vector3d min_rpy;
 };
 
+struct CandidatePose {
+  DiscreteTransformation<double> trans;
+  double score_ratio;  // score as fraction of total source points
+};
+
 class BBS3D {
 public:
   BBS3D();
@@ -80,6 +85,16 @@ public:
 
   void localize();
 
+  // Confidence evaluation
+  double get_confidence_score() const { return confidence_score_; }
+  double get_peak_margin() const { return peak_margin_; }
+  std::vector<DiscreteTransformation<double>> get_top_candidates() const { return top_candidates_; }
+  void set_nms_thresholds(double dist_m, double angle_deg) {
+    nms_dist_thresh_sq_ = dist_m * dist_m;
+    nms_angle_thresh_rad_ = angle_deg * M_PI / 180.0;
+  }
+  AngularInfo get_leaf_angular_info() const { return leaf_ang_info_; }
+
   // pcd iof
   bool load_voxel_params(const std::string& voxelmaps_folder_path);
 
@@ -102,6 +117,12 @@ private:
     const std::vector<Eigen::Vector4i>& buckets,
     const int max_bucket_scan_count,
     const std::vector<Eigen::Vector3d>& points);
+
+  bool is_spatially_distinct(
+    const DiscreteTransformation<double>& a,
+    const DiscreteTransformation<double>& b,
+    double trans_res,
+    const Eigen::Vector3d& rpy_res) const;
 
 private:
   Eigen::Matrix4d global_pose_;
@@ -128,6 +149,14 @@ private:
   std::pair<int, int> init_tx_range_;
   std::pair<int, int> init_ty_range_;
   std::pair<int, int> init_tz_range_;
+
+  // Confidence & multi-peak NMS
+  double confidence_score_ = 0.0;
+  double peak_margin_ = 0.0;
+  std::vector<DiscreteTransformation<double>> top_candidates_;
+  double nms_dist_thresh_sq_ = 4.0;      // 2m default
+  double nms_angle_thresh_rad_ = 0.5236;  // ~30 degrees default
+  AngularInfo leaf_ang_info_;             // stored during localize() for pose reconstruction
 };
 
 }  // namespace cpu
