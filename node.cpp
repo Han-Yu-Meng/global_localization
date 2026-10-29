@@ -44,6 +44,9 @@
 #include <sstream>
 #include <iomanip>
 #include <array>
+#include <cmath>
+#include <limits>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -54,8 +57,9 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     struct Config {
-        Eigen::Vector3d min_search_xyz{-10.0, -20.0, -0.05};
-        Eigen::Vector3d max_search_xyz{200.0, 500.0, 0.05};
+        bool auto_search_range = true;
+        Eigen::Vector3d min_search_xyz{-100.0, -100.0, -0.10};
+        Eigen::Vector3d max_search_xyz{100.0, 100.0, 0.10};
         Eigen::Vector3d min_search_rpy{0.0, 0.0, -M_PI};
         Eigen::Vector3d max_search_rpy{0.0, 0.0, M_PI};
         
@@ -113,84 +117,135 @@ public:
     }
 
     void initialize() override {
-        fins::ParamLoader config("GlobalLocalization");
-        
-        config_.num_threads = config.get("num_threads", 8)
-                                    .with_description("Number of threads for parallel processing (GICP covariance and 3dBBS search)")
-                                    .within(1, 128);
+        fins::ParamLoader bbs("GlobalLocalization.bbs");
+        fins::ParamLoader gicp("GlobalLocalization.gicp_tracking");
 
-        config_.score_threshold = config.get("score_threshold", 0.3)
-                                    .with_description("Minimum score percentage threshold for 3dBBS coarse localization")
-                                    .within(0.0, 10.0);
-        
-        config_.accumulation_time = config.get("accumulation_time", 1.0)
-                                    .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
-                                    .greater_than(0.0);
+        // ---------------- bbs ----------------
+        config_.num_threads = bbs.get("num_threads", 8)
+                                   .with_description("Number of threads for parallel processing (GICP covariance and 3dBBS search)")
+                                   .within(1, 128);
 
-        config_.tracking_interval = config.get("tracking_interval", 1.0)
-                                    .with_description("Time interval between GICP tracking updates (seconds)")
-                                    .greater_than(0.0);
+        config_.score_threshold = bbs.get("score_threshold", 0.3)
+                                      .with_description("Minimum score percentage threshold for 3dBBS coarse localization")
+                                      .within(0.0, 10.0);
 
-        config_.min_level_res = config.get("min_level_res", 1.5)
+        config_.accumulation_time = bbs.get("accumulation_time", 1.0)
+                                        .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
+                                        .greater_than(0.0);
+
+        config_.min_level_res = bbs.get("min_level_res", 1.5)
                                     .with_description("Resolution of the lowest level in the 3dBBS multi-resolution pyramid (meters)")
                                     .greater_than(0.0);
-        
-        config_.max_level = config.get("max_level", 5)
-                                    .with_description("Maximum number of levels in the 3dBBS multi-resolution pyramid");
-        
-        config_.global_leaf_size = config.get("global_leaf_size", 0.5)
-                                    .with_description("Voxel leaf size for the target global map points (meters)")
-                                    .greater_than(0.0);
-        
-        config_.registered_leaf_size = config.get("registered_leaf_size", 0.5)
-                                    .with_description("Voxel leaf size for source clouds during GICP fine registration (meters)")
-                                    .greater_than(0.0);
-        
-        config_.bbs_leaf_size = config.get("bbs_leaf_size", 0.5)
+
+        config_.max_level = bbs.get("max_level", 5)
+                                .with_description("Maximum number of levels in the 3dBBS multi-resolution pyramid");
+
+        config_.global_leaf_size = bbs.get("global_leaf_size", 0.5)
+                                       .with_description("Voxel leaf size for the target global map points (meters)")
+                                       .greater_than(0.0);
+
+        config_.bbs_leaf_size = bbs.get("bbs_leaf_size", 0.5)
                                     .with_description("Voxel leaf size for source clouds during 3dBBS coarse localization (meters)")
                                     .within(0.05, 5.0);
-        
-        config_.viz_leaf_size = config.get("viz_leaf_size", 0.7)
+
+        config_.viz_leaf_size = bbs.get("viz_leaf_size", 0.7)
                                     .with_description("Voxel leaf size for visualization (meters)")
                                     .greater_than(0.0);
-        
-        config_.max_dist_sq_fine = config.get("max_dist_sq_fine", 4.0)
-                                    .with_description("Maximum squared distance for GICP point correspondences (meters^2)")
-                                    .greater_than(0.0);
-        
-        config_.max_gicp_error = config.get("max_gicp_error", 60000.0)
-                                       .with_description("Threshold for GICP convergence error; results exceeding this are treated as failure")
-                                       .greater_than(0.0);
-        
-        config_.voxel_dir = config.get("voxel_dir", std::string(""))
-                                  .with_description("Directory path for storing preprocessed voxel maps");
 
-        config_.smooth_enabled = config.get("smooth_enabled", false)
+        config_.nms_dist_thresh = bbs.get("nms_dist_thresh", 2.0)
+                                      .with_description("Minimum distance (m) between distinct BBS candidate peaks for NMS")
+                                      .greater_than(0.0);
+
+        config_.nms_angle_thresh_deg = bbs.get("nms_angle_thresh_deg", 30.0)
+                                            .with_description("Minimum yaw difference (deg) between distinct BBS candidate peaks for NMS")
+                                            .within(0.0, 180.0);
+
+        config_.voxel_dir = bbs.get("voxel_dir", std::string(""))
+                                .with_description("Directory path for storing preprocessed voxel maps");
+
+        config_.auto_search_range = bbs.get("auto_search_range", true)
+                                        .with_description("If true, derive the x/y search range from the map bounding box "
+                                                          "(z keeps the configured range); otherwise use bbs.search_range");
+
+        // ---------------- bbs.search_range ----------------
+        {
+            fins::ParamLoader search("GlobalLocalization.bbs.search_range");
+            config_.min_search_xyz.x() = search.get("x_min", -100.0)
+                                             .with_description("Minimum x of the 3dBBS translation search range (map frame, meters)");
+            config_.max_search_xyz.x() = search.get("x_max", 100.0)
+                                             .with_description("Maximum x of the 3dBBS translation search range (map frame, meters)");
+            config_.min_search_xyz.y() = search.get("y_min", -100.0)
+                                             .with_description("Minimum y of the 3dBBS translation search range (map frame, meters)");
+            config_.max_search_xyz.y() = search.get("y_max", 100.0)
+                                             .with_description("Maximum y of the 3dBBS translation search range (map frame, meters)");
+            config_.min_search_xyz.z() = search.get("z_min", -0.10)
+                                             .with_description("Minimum z of the 3dBBS translation search range (map frame, meters)");
+            config_.max_search_xyz.z() = search.get("z_max", 0.10)
+                                             .with_description("Maximum z of the 3dBBS translation search range (map frame, meters)");
+        }
+
+        // ---------------- bbs.angle_range ----------------
+        {
+            fins::ParamLoader angle("GlobalLocalization.bbs.angle_range");
+            config_.min_search_rpy.x() = angle.get("roll_min", 0.0)
+                                              .with_description("Minimum roll of the 3dBBS angular search range (radians)");
+            config_.max_search_rpy.x() = angle.get("roll_max", 0.0)
+                                              .with_description("Maximum roll of the 3dBBS angular search range (radians)");
+            config_.min_search_rpy.y() = angle.get("pitch_min", 0.0)
+                                              .with_description("Minimum pitch of the 3dBBS angular search range (radians)");
+            config_.max_search_rpy.y() = angle.get("pitch_max", 0.0)
+                                              .with_description("Maximum pitch of the 3dBBS angular search range (radians)");
+            config_.min_search_rpy.z() = angle.get("yaw_min", -M_PI)
+                                              .with_description("Minimum yaw of the 3dBBS angular search range (radians)");
+            config_.max_search_rpy.z() = angle.get("yaw_max", M_PI)
+                                              .with_description("Maximum yaw of the 3dBBS angular search range (radians)");
+        }
+
+        normalize_search_range();
+
+        // ---------------- gicp_tracking ----------------
+        config_.registered_leaf_size = gicp.get("registered_leaf_size", 0.5)
+                                            .with_description("Voxel leaf size for source clouds during GICP registration (meters)")
+                                            .greater_than(0.0);
+
+        config_.tracking_interval = gicp.get("tracking_interval", 1.0)
+                                         .with_description("Time interval between GICP tracking updates (seconds)")
+                                         .greater_than(0.0);
+
+        config_.max_dist_sq_fine = gicp.get("max_dist_sq_fine", 4.0)
+                                       .with_description("Maximum squared distance for GICP point correspondences (meters^2)")
+                                       .greater_than(0.0);
+
+        config_.max_dist_sq_bbs_refine = gicp.get("max_dist_sq_bbs_refine", 25.0)
+                                            .with_description("Maximum squared distance for GICP refinement after 3dBBS coarse localization (meters^2)")
+                                            .greater_than(0.0);
+
+        config_.max_gicp_error = gicp.get("max_gicp_error", 60000.0)
+                                     .with_description("Threshold for GICP convergence error; results exceeding this are treated as failure")
+                                     .greater_than(0.0);
+
+        config_.max_gicp_failures = gicp.get("max_gicp_failures", 6000)
+                                        .with_description("Number of consecutive GICP failures before falling back to coarse localization")
+                                        .greater_than(0);
+
+        config_.smooth_enabled = gicp.get("smooth_enabled", false)
                                      .with_description("Enable EMA smoothing filter on T_map_odom to prevent localization_pose jumps");
 
-        config_.smooth_alpha = config.get("smooth_alpha", 0.3)
+        config_.smooth_alpha = gicp.get("smooth_alpha", 0.3)
                                     .with_description("Smoothing factor for EMA filter (0.0 = frozen, 1.0 = no smoothing). Lower = smoother but more lag.")
                                     .within(0.0, 1.0);
 
-        config_.pose_trigger = config.get("pose_trigger", std::string("tf"))
-                                     .with_description("Pose publish trigger: 'tf' = every odom callback, 'gicp' = only on GICP update");
+        config_.pose_trigger = gicp.get("pose_trigger", std::string("tf"))
+                                   .with_description("Pose publish trigger: 'tf' = every odom callback, 'gicp' = only on GICP update");
 
-        config_.planar_constraint = config.get("planar_constraint", false)
+        config_.planar_constraint = gicp.get("planar_constraint", false)
                                         .with_description("If true, force roll=0, pitch=0, z=0 on map->odom transform and current_pose output");
-
-        config_.nms_dist_thresh = config.get("nms_dist_thresh", 2.0)
-                                       .with_description("Minimum distance (m) between distinct BBS candidate peaks for NMS")
-                                       .greater_than(0.0);
-
-        config_.nms_angle_thresh_deg = config.get("nms_angle_thresh_deg", 30.0)
-                                             .with_description("Minimum yaw difference (deg) between distinct BBS candidate peaks for NMS")
-                                             .within(0.0, 180.0);
 
         bbs3d_ = std::make_unique<cpu::BBS3D>();
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
-        std::string map_path = config.get("map_dir", std::string(""))
-                                     .with_description("Directory to load map file");
+        std::string map_path = bbs.get("map_dir", std::string(""))
+                                   .with_description("Directory to load map file");
         
         if (!map_path.empty()) load_map(map_path);
 
@@ -222,6 +277,22 @@ public:
     }
 
 private:
+    /// 保证 min <= max（配置写反时自动交换并告警）
+    void normalize_search_range() {
+        auto fix = [this](double& lo, double& hi, const char* name) {
+            if (lo > hi) {
+                logger->warn("[Config] {}_min ({}) > {}_max ({}), swapping the two values.", name, lo, name, hi);
+                std::swap(lo, hi);
+            }
+        };
+        fix(config_.min_search_xyz.x(), config_.max_search_xyz.x(), "x");
+        fix(config_.min_search_xyz.y(), config_.max_search_xyz.y(), "y");
+        fix(config_.min_search_xyz.z(), config_.max_search_xyz.z(), "z");
+        fix(config_.min_search_rpy.x(), config_.max_search_rpy.x(), "roll");
+        fix(config_.min_search_rpy.y(), config_.max_search_rpy.y(), "pitch");
+        fix(config_.min_search_rpy.z(), config_.max_search_rpy.z(), "yaw");
+    }
+
     void load_map(const std::string& path) {
         pcl::PointCloud<pcl::PointXYZI>::Ptr raw_map(new pcl::PointCloud<pcl::PointXYZI>());
         if (pcl::io::loadPCDFile(path, *raw_map) == -1) {
@@ -245,7 +316,54 @@ private:
         bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
         bbs3d_->set_score_threshold_percentage(config_.score_threshold);
         bbs3d_->set_nms_thresholds(config_.nms_dist_thresh, config_.nms_angle_thresh_deg);
-        bbs3d_->set_num_threads(16);
+        bbs3d_->set_num_threads(config_.num_threads);
+
+        // 搜索范围只与地图和静态配置有关，加载地图后设置一次即可
+        Eigen::Vector3d min_xyz = config_.min_search_xyz;
+        Eigen::Vector3d max_xyz = config_.max_search_xyz;
+        if (config_.auto_search_range) {
+            Eigen::Vector3d bb_min = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+            Eigen::Vector3d bb_max = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+            for (const auto& p : raw_map->points) {
+                if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+                const Eigen::Vector3d v(p.x, p.y, p.z);
+                bb_min = bb_min.cwiseMin(v);
+                bb_max = bb_max.cwiseMax(v);
+            }
+            if (bb_min.allFinite() && bb_max.allFinite() && (bb_max - bb_min).norm() > 1e-6) {
+                min_xyz.x() = bb_min.x();
+                max_xyz.x() = bb_max.x();
+                min_xyz.y() = bb_min.y();
+                max_xyz.y() = bb_max.y();
+                // z 依旧使用配置值（默认 -0.10 ~ 0.10），地面机器人的高度搜索不需要地面以下/以上的空间
+            } else {
+                logger->warn("[3dBBS] auto_search_range is on but the map bounding box is invalid, "
+                             "falling back to the configured search_range.");
+            }
+        }
+        bbs3d_->set_trans_search_range(min_xyz, max_xyz);
+        bbs3d_->set_angular_search_range(config_.min_search_rpy, config_.max_search_rpy);
+
+        // 顶层候选规模估算：地图很大而顶层分辨率又很细时，初始化候选集会膨胀得很快
+        // （真实候选数还要再乘上每个角度的划分数，通常是 10~30 倍）
+        const double top_res = config_.min_level_res * std::pow(2.0, static_cast<double>(config_.max_level));
+        const double init_cells = ((max_xyz.x() - min_xyz.x()) / top_res + 1.0) *
+                                  ((max_xyz.y() - min_xyz.y()) / top_res + 1.0) *
+                                  ((max_xyz.z() - min_xyz.z()) / top_res + 1.0);
+        if (init_cells > 2.0e5) {
+            logger->warn("[3dBBS] Initial translation cells ~{:.0f} (top level resolution {:.2f} m); "
+                         "the search may be slow - consider increasing bbs.min_level_res / bbs.max_level, "
+                         "or turning off bbs.auto_search_range and giving a tighter bbs.search_range.",
+                         init_cells, top_res);
+        }
+
+        logger->info("[3dBBS] num_threads={}, auto_search_range={}", config_.num_threads, config_.auto_search_range);
+        logger->info("[3dBBS] Search range: x[{:.3f}, {:.3f}] y[{:.3f}, {:.3f}] z[{:.3f}, {:.3f}] m | "
+                     "rpy[{:.4f}, {:.4f}] [{:.4f}, {:.4f}] [{:.4f}, {:.4f}] rad",
+                     min_xyz.x(), max_xyz.x(), min_xyz.y(), max_xyz.y(), min_xyz.z(), max_xyz.z(),
+                     config_.min_search_rpy.x(), config_.max_search_rpy.x(),
+                     config_.min_search_rpy.y(), config_.max_search_rpy.y(),
+                     config_.min_search_rpy.z(), config_.max_search_rpy.z());
 
         map_ready_ = true;
         state_ = SystemState::COARSE_LOCALIZATION;
@@ -361,8 +479,7 @@ private:
         for (auto& p : cloud_bbs->points) src_points.push_back(p.getVector3fMap().cast<double>());
         
         bbs3d_->set_src_points(src_points);
-        bbs3d_->set_trans_search_range(config_.min_search_xyz, config_.max_search_xyz);
-        bbs3d_->set_angular_search_range(config_.min_search_rpy, config_.max_search_rpy);
+        // 平移/角度搜索范围已在 load_map() 中按配置（或地图包围盒）设置完毕
         
         bbs3d_->localize();
 
