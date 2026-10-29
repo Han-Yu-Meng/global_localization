@@ -1,4 +1,5 @@
 #include <cpu_bbs3d/voxelmaps.hpp>
+#include <algorithm>
 #include <cmath>
 
 namespace cpu {
@@ -22,7 +23,7 @@ void VoxelMaps::create_voxelmaps(const std::vector<Eigen::Vector3d>& points, con
     return (point.array() / resolution).floor().cast<int>();
   });
 
-  // 1 = core voxel (weight 1.0), -1 = dilated neighbor (weight 0.5)
+  // 1 = core voxel (score 2.0), -1 = dilated neighbor (score = neighbor_score_, 默认 1.0)
   for (const auto& coord : coords) {
     if (weighted_map.count(coord) == 0) {
       weighted_map[coord] = 1;  // core
@@ -56,7 +57,7 @@ VoxelMaps::UnorderedVoxelMap VoxelMaps::max_pool_voxel_map(
   // parent_coord = floor(child_coord / v_rate)
   UnorderedVoxelMap coarse_map;
   for (const auto& [child_coord, child_weight] : fine_map) {
-    // child_weight: 1 (core=1.0) or -1 (neighbor=0.5)
+    // child_weight: 1 (core) or -1 (neighbor，具体分数由 neighbor_score_ 决定)
     // Max-pool: take max weight among all children mapping to same parent
     Eigen::Vector3i parent_coord(
       static_cast<int>(std::floor(static_cast<double>(child_coord.x()) / v_rate)),
@@ -76,10 +77,14 @@ VoxelMaps::UnorderedVoxelMap VoxelMaps::max_pool_voxel_map(
 }
 
 VoxelMaps::Buckets VoxelMaps::create_hash_buckets_weighted(const UnorderedVoxelMap& unordered_voxelmap) {
-  // Same as create_hash_buckets but stores quantized weight in .w():
-  //   core (1)  → .w() = 2  (represents weight 1.0)
-  //   neighbor (-1) → .w() = 1  (represents weight 0.5)
-  //   empty/absent  → .w() = 0  (empty sentinel, unchanged)
+  // Same as create_hash_buckets but stores quantized score in .w():
+  //   core (1)      → .w() = 2                (core voxel always scores 2.0)
+  //   neighbor (-1) → .w() = round(neighbor_score_)
+  //                   neighbor_score_ = 1.0 → 加权 BBS（邻居半权）
+  //                   neighbor_score_ = 2.0 → 原始 3D-BBS（命中即满分，无加权惩罚）
+  //   empty/absent  → .w() = 0                (empty sentinel, unchanged)
+  // 夹到 [1, 2]：.w() == 0 是空槽哨兵值，绝不能让邻居分数取到 0
+  const int neighbor_w = std::clamp(static_cast<int>(std::lround(neighbor_score_)), 1, 2);
   std::vector<Eigen::Vector4i> buckets;
   for (int num_buckets = unordered_voxelmap.size(); num_buckets <= unordered_voxelmap.size() * 16; num_buckets *= 2) {
     buckets.resize(num_buckets);
@@ -87,7 +92,7 @@ VoxelMaps::Buckets VoxelMaps::create_hash_buckets_weighted(const UnorderedVoxelM
 
     int success_count = 0;
     for (const auto& voxel : unordered_voxelmap) {
-      int weight = (voxel.second == 1) ? 2 : 1;  // core=2, neighbor=1
+      int weight = (voxel.second == 1) ? 2 : neighbor_w;  // core=2, neighbor=neighbor_score_
       Eigen::Vector4i coord;
       coord << voxel.first.x(), voxel.first.y(), voxel.first.z(), weight;
       const std::uint32_t hash = (coord[0] * 73856093) ^ (coord[1] * 19349669) ^ (coord[2] * 83492791);

@@ -34,11 +34,17 @@ public:
 
   void set_max_bucket_scan_count(int max_bucket_scan_count) { max_bucket_scan_count_ = max_bucket_scan_count; }
 
+  /// 邻居体素命中分数（核心体素固定 2.0）：1.0 = 加权 BBS，2.0 = 原始 3D-BBS
+  /// 必须在 create_voxelmaps() 之前设置，权重在建图时写进 buckets 的 .w()
+  void set_neighbor_score(double neighbor_score) { neighbor_score_ = neighbor_score; }
+
   double get_min_res() const { return min_level_res_; }
 
   int get_max_level() const { return max_level_; }
 
   int get_max_bucket_scan_count() const { return max_bucket_scan_count_; }
+
+  double get_neighbor_score() const { return neighbor_score_; }
 
   void create_voxelmaps(const std::vector<Eigen::Vector3d>& points, const int v_rate);
 
@@ -59,5 +65,6 @@ public:
 private:
   double min_level_res_;
   int max_level_, max_bucket_scan_count_;
+  double neighbor_score_ = 1.0;  // 邻居体素命中分数（核心固定 2.0）
 };
 }  // namespace cpu

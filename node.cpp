@@ -94,6 +94,9 @@ public:
         // NMS and confidence evaluation thresholds
         double nms_dist_thresh = 2.0;       // meters
         double nms_angle_thresh_deg = 30.0;  // degrees
+
+        // 邻居体素命中分数（核心体素固定 2.0）：1.0 = 加权 BBS，2.0 = 原始 3D-BBS
+        double neighbor_score = 1.0;
     };
 
     struct JobData {
@@ -128,6 +131,11 @@ public:
         config_.score_threshold = bbs.get("score_threshold", 0.3)
                                       .with_description("Minimum score percentage threshold for 3dBBS coarse localization")
                                       .within(0.0, 10.0);
+
+        config_.neighbor_score = bbs.get("neighbor_score", 1.0)
+                                     .with_description("Neighbor voxel hit score (core voxel is fixed at 2.0): "
+                                                       "1.0 = weighted 3D-BBS, 2.0 = original 3D-BBS (no neighbor penalty)")
+                                     .within(1.0, 2.0);
 
         config_.accumulation_time = bbs.get("accumulation_time", 1.0)
                                         .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
@@ -313,6 +321,8 @@ private:
 
         std::vector<Eigen::Vector3d> tar_points;
         for (auto& p : map_algo->points) tar_points.push_back(p.getVector3fMap().cast<double>());
+        // 邻居体素分数在建体素图时固化，必须在 set_tar_points() 之前设置
+        bbs3d_->set_neighbor_score(config_.neighbor_score);
         bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
         bbs3d_->set_score_threshold_percentage(config_.score_threshold);
         bbs3d_->set_nms_thresholds(config_.nms_dist_thresh, config_.nms_angle_thresh_deg);
@@ -357,7 +367,9 @@ private:
                          init_cells, top_res);
         }
 
-        logger->info("[3dBBS] num_threads={}, auto_search_range={}", config_.num_threads, config_.auto_search_range);
+        logger->info("[3dBBS] num_threads={}, auto_search_range={}, neighbor_score={} ({})",
+                     config_.num_threads, config_.auto_search_range, config_.neighbor_score,
+                     config_.neighbor_score >= 2.0 ? "original 3D-BBS" : "weighted 3D-BBS");
         logger->info("[3dBBS] Search range: x[{:.3f}, {:.3f}] y[{:.3f}, {:.3f}] z[{:.3f}, {:.3f}] m | "
                      "rpy[{:.4f}, {:.4f}] [{:.4f}, {:.4f}] [{:.4f}, {:.4f}] rad",
                      min_xyz.x(), max_xyz.x(), min_xyz.y(), max_xyz.y(), min_xyz.z(), max_xyz.z(),

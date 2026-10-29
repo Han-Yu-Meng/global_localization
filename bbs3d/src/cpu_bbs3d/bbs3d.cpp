@@ -26,6 +26,7 @@ void BBS3D::set_tar_points(const std::vector<Eigen::Vector3d>& points, double mi
   voxelmaps_ptr_.reset(new VoxelMaps);
   voxelmaps_ptr_->set_min_res(min_level_res);
   voxelmaps_ptr_->set_max_level(max_level);
+  voxelmaps_ptr_->set_neighbor_score(neighbor_score_);  // 权重在建图时固化，必须先设
   voxelmaps_ptr_->create_voxelmaps(points, v_rate_);
 }
 

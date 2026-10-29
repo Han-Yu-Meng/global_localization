@@ -4,6 +4,8 @@ GlobalLocalization:
     max_level: 5           # BBS 多层级体素地图的总层数
     num_threads: 8         # bbs 算法 / GICP 协方差估计等并行计算使用的线程数
     score_threshold: 0.75  # 提高阈值，加速剪枝并过滤错位匹配
+    # 邻居体素命中分数（核心体素固定 2.0）：1.0 = 加权 BBS，2.0 = 原始 3D-BBS
+    neighbor_score: 2.0
 
     global_leaf_size: 0.3  # 全局地图下采样分辨率
     bbs_leaf_size: 0.3     # 当前帧 BBS 匹配下采样分辨率

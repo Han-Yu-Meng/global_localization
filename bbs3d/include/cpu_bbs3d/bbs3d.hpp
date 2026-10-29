@@ -48,6 +48,10 @@ public:
 
   void set_num_threads(const int num_threads) { num_threads_ = num_threads; }
 
+  /// 邻居体素命中分数（核心体素固定 2.0）：1.0 = 加权 BBS，2.0 = 原始 3D-BBS
+  /// 需在 set_tar_points() 之前调用，因为权重在建体素图时就写进了 buckets
+  void set_neighbor_score(const double neighbor_score) { neighbor_score_ = neighbor_score; }
+
   void set_score_threshold_percentage(double percentage) { score_threshold_percentage_ = percentage; }
 
   void enable_timeout() { use_timeout_ = true; }
@@ -137,6 +141,7 @@ private:
   double v_rate_;  // voxel expansion rate
   double inv_v_rate_;
   int num_threads_;
+  double neighbor_score_ = 1.0;  // 邻居体素命中分数（核心固定 2.0）
 
   double best_score_;
   double score_threshold_percentage_;
