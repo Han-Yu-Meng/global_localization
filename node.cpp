@@ -132,10 +132,7 @@ public:
                                       .with_description("Minimum score percentage threshold for 3dBBS coarse localization")
                                       .within(0.0, 10.0);
 
-        config_.neighbor_score = bbs.get("neighbor_score", 1.0)
-                                     .with_description("Neighbor voxel hit score (core voxel is fixed at 2.0): "
-                                                       "1.0 = weighted 3D-BBS, 2.0 = original 3D-BBS (no neighbor penalty)")
-                                     .within(1.0, 2.0);
+        config_.neighbor_score = 2.0;
 
         config_.accumulation_time = bbs.get("accumulation_time", 1.0)
                                         .with_description("Time duration to accumulate input point clouds before triggering localization (seconds)")
