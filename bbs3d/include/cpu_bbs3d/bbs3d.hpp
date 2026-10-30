@@ -25,6 +25,8 @@ struct CandidatePose {
 
 class BBS3D {
 public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
   BBS3D();
   ~BBS3D();
 
