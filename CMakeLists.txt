@@ -27,19 +27,26 @@ add_library(cpu_bbs3d
 
 set_target_properties(cpu_bbs3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-target_link_libraries(cpu_bbs3d
+target_link_libraries(cpu_bbs3d PRIVATE
   ${PCL_LIBRARIES}
   Eigen3::Eigen
   OpenMP::OpenMP_CXX
 )
 
-# 2. 【关键修正】为 cpu_bbs3d 静态库应用最高级别的 CPU 优化选项和硬件矢量化
-target_compile_options(cpu_bbs3d PRIVATE
+# 2. SIMD 选项必须由所有包含 bbs3d.hpp 的目标共享：
+#    Eigen 的 EIGEN_MAX_ALIGN_BYTES 会随 ISA 选项变化，两个 TU 看到的
+#    alignof(BBS3D) 不一致时，new 出来的对象按较低对齐分配，构造函数却按
+#    更高对齐写入，直接 SIGSEGV。
+#    这里刻意不使用 -march=native：保持 x86-64 通用指令集，保证不同 x64 机器
+#    上编译/运行行为一致（可迁移性优先于峰值性能）。
+add_library(bbs3d_simd_flags INTERFACE)
+target_compile_options(bbs3d_simd_flags INTERFACE
   -O3
   -ffast-math
   -DNDEBUG
-  -march=native  # 允许编译器利用当前编译机器支持的所有 CPU 特性（AVX2, AVX512, SSE4 等）
 )
+
+target_link_libraries(cpu_bbs3d PRIVATE bbs3d_simd_flags)
 
 # 3. 定义并编译 ROS 节点
 fins_add_node(${PROJECT_NAME}
@@ -53,14 +60,9 @@ fins_link_ros_dependencies(${PROJECT_NAME}
   visualization_msgs
 )
 
-# 4. 【关键修正】同样为节点目标应用最高级别优化和矢量化
-target_compile_options(${PROJECT_NAME} PRIVATE
-  -O3
-  -ffast-math
-  -DNDEBUG
-)
-
+# 4. 节点目标与 cpu_bbs3d 使用完全相同的 SIMD 选项（切勿只为静态库单独加 ISA 选项）
 target_link_libraries(${PROJECT_NAME} PRIVATE
+  bbs3d_simd_flags
   cpu_bbs3d
   small_gicp::small_gicp
   ${PCL_LIBRARIES}
