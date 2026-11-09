@@ -37,6 +37,8 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <thread>
+#include <std_msgs/msg/string.hpp>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <filesystem>
@@ -57,6 +59,7 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     struct Config {
+        bool initialization_only = false;
         bool auto_search_range = true;
         Eigen::Vector3d min_search_xyz{-100.0, -100.0, -0.10};
         Eigen::Vector3d max_search_xyz{100.0, 100.0, 0.10};
@@ -116,6 +119,8 @@ public:
         register_output<geometry_msgs::msg::TransformStamped>("$T_{map}^{odom}$");
         register_output<geometry_msgs::msg::PoseWithCovarianceStamped>("current_pose");
         register_output<geometry_msgs::msg::PoseWithCovarianceStamped>("initial_pose");
+        register_input<std_msgs::msg::String>("tracking_status", &GlobalLocalizationNode::on_tracking_status);
+        register_output<geometry_msgs::msg::TransformStamped>("initial_alignment");
         register_output<visualization_msgs::msg::MarkerArray>("bbs_candidates");
     }
 
@@ -123,6 +128,7 @@ public:
         fins::ParamLoader bbs("GlobalLocalization.bbs");
         fins::ParamLoader gicp("GlobalLocalization.gicp_tracking");
 
+        config_.initialization_only = fins::param_server().get("GlobalLocalization.initialization_only", false);
         // ---------------- bbs ----------------
         config_.num_threads = bbs.get("num_threads", 8)
                                    .with_description("Number of threads for parallel processing (GICP covariance and 3dBBS search)")
@@ -385,21 +391,54 @@ private:
         }
     }
 
-    void on_odom_tf_callback(const fins::Msg<geometry_msgs::msg::TransformStamped>& msg) {
+    void on_tracking_status(const std_msgs::msg::String &msg) {
+        if (!config_.initialization_only) return;
         std::lock_guard<std::mutex> lock(data_mtx_);
-        latest_T_odom_base_ = tf2::transformToEigen(*msg);
-        tf_received_ = true;
-
-        if (map_ready_ && state_ != SystemState::IDLE && config_.pose_trigger == "tf") {
-            publish_current_pose(msg.acq_time, latest_T_odom_base_);
+        bool reset_requested = (msg.data == "LOST" && last_tracking_status_ != "LOST") ||
+                               msg.data == "INITIALIZATION_REJECTED";
+        last_tracking_status_ = msg.data;
+        if (reset_requested && state_ == SystemState::FINE_LOCALIZATION) {
+            state_ = SystemState::COARSE_LOCALIZATION;
+            accumulated_cloud_odom_->clear();
+            accumulation_started_ = false;
+            job_.has_new_job = false;
+            logger->warn("[Initializer] Tracker requested reinitialization: {}", msg.data);
         }
     }
 
-    void on_cloud_callback(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom_in, fins::AcqTime acq_time) {
-        if (!map_ready_ || state_ == SystemState::IDLE || !tf_received_) return;
+    void on_odom_tf_callback(const fins::Msg<geometry_msgs::msg::TransformStamped>& msg) {
+        pcl::PointCloud<pcl::PointXYZI>::Ptr waiting;
+        {
+            std::lock_guard<std::mutex> lock(data_mtx_);
+            latest_T_odom_base_ = tf2::transformToEigen(*msg);
+            tf_received_ = true;
+            double ts = fins::to_seconds(msg.acq_time);
+            odom_history_[ts] = latest_T_odom_base_;
+            while (odom_history_.size() > 1000) odom_history_.erase(odom_history_.begin());
+            auto it = pending_clouds_.find(ts);
+            if (it != pending_clouds_.end()) { waiting = it->second; pending_clouds_.erase(it); }
+            if (!config_.initialization_only && map_ready_ && state_ != SystemState::IDLE && config_.pose_trigger == "tf") {
+                publish_current_pose(msg.acq_time, latest_T_odom_base_);
+            }
+        }
+        if (waiting) on_cloud_callback(waiting, msg.acq_time);
+    }
 
+    void on_cloud_callback(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom_in, fins::AcqTime acq_time) {
         std::unique_lock<std::mutex> lock(data_mtx_);
+        if (!map_ready_ || state_ == SystemState::IDLE) return;
+        if (config_.initialization_only && state_ != SystemState::COARSE_LOCALIZATION) return;
         double cur_time = fins::to_seconds(acq_time);
+        Eigen::Isometry3d cloud_pose = latest_T_odom_base_;
+        if (config_.initialization_only) {
+            auto it = odom_history_.find(cur_time);
+            if (it == odom_history_.end()) {
+                pending_clouds_[cur_time] = cloud_odom_in;
+                while (pending_clouds_.size() > 30) pending_clouds_.erase(pending_clouds_.begin());
+                return;
+            }
+            cloud_pose = it->second;
+        } else if (!tf_received_) return;
 
         // 精定位阶段：累积 1s 点云后触发 GICP 配准
         if (state_ == SystemState::FINE_LOCALIZATION) {
@@ -417,7 +456,7 @@ private:
                 if (!is_processing_job_) {
                     job_.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(*accumulated_cloud_odom_));
                     job_.ts = acq_time;
-                    job_.T_odom_base = latest_T_odom_base_;
+                    job_.T_odom_base = cloud_pose;
                     job_.has_new_job = true;
                     last_gicp_run_time_ = cur_time;
                     accumulated_cloud_odom_->clear();
@@ -441,7 +480,7 @@ private:
             if (!is_processing_job_) {
                 job_.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(*accumulated_cloud_odom_));
                 job_.ts = acq_time;
-                job_.T_odom_base = latest_T_odom_base_;
+                job_.T_odom_base = cloud_pose;
                 job_.has_new_job = true;
                 cv_.notify_one();
             }
@@ -463,7 +502,7 @@ private:
 
             if (state_ == SystemState::COARSE_LOCALIZATION) {
                 perform_coarse_localization(current_job);
-            } else if (state_ == SystemState::FINE_LOCALIZATION) {
+            } else if (!config_.initialization_only && state_ == SystemState::FINE_LOCALIZATION) {
                 perform_fine_tracking(current_job);
             }
             is_processing_job_ = false;
@@ -532,6 +571,11 @@ private:
             logger->info("[3dBBS->GICP] Refine converged={}, error={:.2f}, iter={}, time={:.2f}ms", 
                          res.converged, res.error, res.iterations, refine_duration_ms);
 
+            if (config_.initialization_only && (!res.converged || !std::isfinite(res.error) ||
+                res.error > config_.max_gicp_error || !res.T_target_source.matrix().allFinite())) {
+                logger->warn("[Initializer] BBS candidate rejected: GICP refinement did not pass quality gate");
+                return;
+            }
             Eigen::Isometry3d T_map_base_final = res.converged ? res.T_target_source : T_map_base_bbs;
 
             {
@@ -545,10 +589,18 @@ private:
                 // 清空累积点云，为精定位阶段的 1s 累积做准备
                 accumulated_cloud_odom_->clear();
                 last_gicp_run_time_ = -1.0;  // 标记：等待首个点云到达时开始计时
-                if (config_.pose_trigger == "gicp") {
+                if (!config_.initialization_only && config_.pose_trigger == "gicp") {
                     publish_current_pose(job.ts, job.T_odom_base);
                 }
                 publish_initial_pose(job.ts, job.T_odom_base);
+            }
+            if (config_.initialization_only) {
+                geometry_msgs::msg::TransformStamped alignment;
+                alignment.header.stamp = fins::to_ros_msg_time(job.ts);
+                alignment.header.frame_id = "map"; alignment.child_frame_id = "odom";
+                alignment.transform = tf2::eigenToTransform(T_map_odom_).transform;
+                send("initial_alignment", alignment, job.ts);
+                logger->info("[Initializer] BBS + GICP accepted; handing map->odom alignment to FAST-LIO, no periodic GICP");
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
@@ -864,7 +916,10 @@ private:
     }
 
     Config config_;
-    SystemState state_{SystemState::IDLE};
+    std::atomic<SystemState> state_{SystemState::IDLE};
+    std::string last_tracking_status_;
+    std::map<double, Eigen::Isometry3d> odom_history_;
+    std::map<double, pcl::PointCloud<pcl::PointXYZI>::Ptr> pending_clouds_;
     bool map_ready_{false};
     bool tf_received_{false};
     
@@ -882,7 +937,7 @@ private:
     pcl::PointCloud<pcl::PointXYZI>::Ptr accumulated_cloud_odom_;
 
     JobData job_;
-    bool is_processing_job_ = false;
+    std::atomic<bool> is_processing_job_{false};
     std::mutex data_mtx_;
     std::condition_variable cv_;
     

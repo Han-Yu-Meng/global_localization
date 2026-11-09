@@ -42,7 +42,6 @@ target_link_libraries(cpu_bbs3d PRIVATE
 add_library(bbs3d_simd_flags INTERFACE)
 target_compile_options(bbs3d_simd_flags INTERFACE
   -O3
-  -ffast-math
   -DNDEBUG
 )
 
@@ -55,6 +54,7 @@ fins_add_node(${PROJECT_NAME}
 
 fins_link_ros_dependencies(${PROJECT_NAME}
   geometry_msgs
+  std_msgs
   nav_msgs
   tf2_eigen
   visualization_msgs
