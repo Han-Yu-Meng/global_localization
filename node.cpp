@@ -48,11 +48,13 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <chrono>
+#include <cstdlib>
 #include <utility>
 
 namespace fs = std::filesystem;
 
-enum class SystemState { IDLE, COARSE_LOCALIZATION, FINE_LOCALIZATION };
+enum class SystemState { IDLE, COARSE_LOCALIZATION, FINE_LOCALIZATION, UNKNOWN_AREA };
 
 class GlobalLocalizationNode : public fins::Node {
 public:
@@ -100,6 +102,25 @@ public:
 
         // 邻居体素命中分数（核心体素固定 2.0）：1.0 = 加权 BBS，2.0 = 原始 3D-BBS
         double neighbor_score = 1.0;
+
+        // 单轮 3dBBS 搜索时限（毫秒），<=0 不限。无匹配（陌生区域）时 BBS 最坏情况
+        // 会把整个搜索空间翻完（数百个候选逐层扩展、每个都要对全源点云打分），可达数分钟；
+        // 设上限后超时按「未匹配」计入失败次数，配合 max_init_attempts 快速判负。
+        int bbs_timeout_msec = 30000;
+
+        // ---- 接受门控：BBS+GICP 结果必须真的落在地图上（initialization_only）----
+        // res.error 是 covariance 加权残差和、不是米制量：错位候选只靠少量远距对应点
+        // 就能把它拉低（实测错位 accept 的 error 比正确 accept 低一个数量级），
+        // 因此接受前必须独立复核「变换后的源点在地图上的最近邻命中率」。
+        int    min_init_inliers = 100;        // GICP 有效对应点数下限
+        double min_init_inlier_ratio = 0.25;  // 有效对应点 / 源点数 下限
+        double init_verify_max_dist = 0.5;    // 落图复核的最近邻距离门限 (m)
+        double min_init_overlap_ratio = 0.30; // 落图复核命中率下限
+
+        // ---- 初始化尝试上限与陌生区域处理（initialization_only）----
+        int         max_init_attempts = 3;         // 连续失败多少次判定陌生区域
+        std::string unknown_area_action = "stop";  // "stop" = 停止匹配驻留；"exit" = 退出进程
+        double      unknown_area_retry_sec = 0.0;  // >0 陌生区域隔多久重试一次；0 = 不再尝试
     };
 
     struct JobData {
@@ -122,11 +143,13 @@ public:
         register_input<std_msgs::msg::String>("tracking_status", &GlobalLocalizationNode::on_tracking_status);
         register_output<geometry_msgs::msg::TransformStamped>("initial_alignment");
         register_output<visualization_msgs::msg::MarkerArray>("bbs_candidates");
+        register_output<std_msgs::msg::String>("initializer_status");
     }
 
     void initialize() override {
         fins::ParamLoader bbs("GlobalLocalization.bbs");
         fins::ParamLoader gicp("GlobalLocalization.gicp_tracking");
+        fins::ParamLoader init_cfg("GlobalLocalization.initializer");
 
         config_.initialization_only = fins::param_server().get("GlobalLocalization.initialization_only", false);
         // ---------------- bbs ----------------
@@ -137,6 +160,10 @@ public:
         config_.score_threshold = bbs.get("score_threshold", 0.3)
                                       .with_description("Minimum score percentage threshold for 3dBBS coarse localization")
                                       .within(0.0, 10.0);
+
+        config_.bbs_timeout_msec = bbs.get("timeout_msec", 30000)
+                                       .with_description("Per-search 3dBBS time limit in milliseconds (<=0 disables); a timed-out search counts as no-match")
+                                       .greater_than(-1);
 
         config_.neighbor_score = 2.0;
 
@@ -252,7 +279,35 @@ public:
         config_.planar_constraint = gicp.get("planar_constraint", false)
                                         .with_description("If true, force roll=0, pitch=0, z=0 on map->odom transform and current_pose output");
 
+        // ---------------- initializer（接受门控 + 陌生区域处理） ----------------
+        config_.min_init_inliers = init_cfg.get("min_init_inliers", 100)
+                                       .with_description("Minimum GICP inlier count for accepting a BBS+GICP initialization")
+                                       .greater_than(0);
+        config_.min_init_inlier_ratio = init_cfg.get("min_init_inlier_ratio", 0.25)
+                                            .with_description("Minimum GICP inlier count / source size ratio for acceptance")
+                                            .within(0.0, 1.0);
+        config_.init_verify_max_dist = init_cfg.get("init_verify_max_dist", 0.5)
+                                           .with_description("NN distance gate (m) for the independent map-overlap verification")
+                                           .greater_than(0.0);
+        config_.min_init_overlap_ratio = init_cfg.get("min_init_overlap_ratio", 0.30)
+                                             .with_description("Minimum fraction of transformed source points within init_verify_max_dist of the map")
+                                             .within(0.0, 1.0);
+        config_.max_init_attempts = init_cfg.get("max_init_attempts", 3)
+                                        .with_description("Consecutive failed initialization attempts before declaring unknown area")
+                                        .greater_than(0);
+        config_.unknown_area_action = init_cfg.get("unknown_area_action", std::string("stop"))
+                                          .with_description("On unknown area: 'stop' = stop matching and idle, 'exit' = terminate the process");
+        config_.unknown_area_retry_sec = init_cfg.get("unknown_area_retry_sec", 0.0)
+                                             .with_description("Retry matching after this many seconds in unknown area (0 = never)")
+                                             .greater_than(-0.001);
+
         bbs3d_ = std::make_unique<cpu::BBS3D>();
+        if (config_.bbs_timeout_msec > 0) {
+            bbs3d_->enable_timeout();
+            bbs3d_->set_timeout_duration_in_msec(config_.bbs_timeout_msec);
+        } else {
+            bbs3d_->disable_timeout();
+        }
         accumulated_cloud_odom_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
         std::string map_path = bbs.get("map_dir", std::string(""))
@@ -279,6 +334,8 @@ public:
         accumulation_started_ = false;
         consecutive_gicp_failures_ = 0;
         has_filtered_pose_ = false;
+        init_failures_ = 0;
+        init_accepted_pending_ = false;
     }
 
     ~GlobalLocalizationNode() {
@@ -302,6 +359,71 @@ private:
         fix(config_.min_search_rpy.x(), config_.max_search_rpy.x(), "roll");
         fix(config_.min_search_rpy.y(), config_.max_search_rpy.y(), "pitch");
         fix(config_.min_search_rpy.z(), config_.max_search_rpy.z(), "yaw");
+    }
+
+    // ---- 落图复核：源点按候选位姿变换到地图系后，最近邻距离门限内的命中率 ----
+    struct OverlapStat { size_t hit = 0; size_t total = 0; double ratio = 0.0; };
+
+    OverlapStat verify_overlap(const pcl::PointCloud<pcl::PointCovariance>::Ptr& src_base,
+                               const Eigen::Isometry3d& T_map_base) const {
+        OverlapStat out;
+        if (!target_tree_ || !target_covs_ || !src_base || src_base->empty()) return out;
+        const double max_sq = config_.init_verify_max_dist * config_.init_verify_max_dist;
+        const Eigen::Matrix3d R = T_map_base.linear();
+        const Eigen::Vector3d t = T_map_base.translation();
+        for (const auto& p : src_base->points) {
+            const Eigen::Vector3d w = R * p.getVector3fMap().cast<double>() + t;
+            size_t idx = 0;
+            double sq = std::numeric_limits<double>::max();
+            // small_gicp 的 KdTree 距离是 4 维 squaredNorm；地图点云由 load_map
+            // 只写 xyz 构建，第 4 维为 0。查询第 4 维也必须填 0，否则即使点完全
+            // 重合也会恒定多出 1.0，导致命中率恒为 0（真匹配一并被误杀）。
+            size_t found = target_tree_->nearest_neighbor_search(
+                Eigen::Vector4d(w.x(), w.y(), w.z(), 0.0), &idx, &sq);
+            ++out.total;
+            if (!found || idx >= target_covs_->size()) continue;
+            // 不依赖第 4 维约定：用返回的最近点索引自己按 3 维重算距离。
+            // 第 4 维对所有地图点是同一常数，不影响 argmin，故 idx 就是 3 维最近点。
+            const Eigen::Vector3d mp = target_covs_->points[idx].getVector3fMap().cast<double>();
+            if ((mp - w).squaredNorm() <= max_sq) ++out.hit;
+        }
+        out.ratio = out.total ? double(out.hit) / double(out.total) : 0.0;
+        return out;
+    }
+
+    // ---- 初始化失败计数：连续 max_init_attempts 次 -> 判定陌生区域 ----
+    void note_init_failure(const std::string& why) {
+        if (!config_.initialization_only) return;
+        const int n = ++init_failures_;
+        logger->warn("[Initializer] 初始化尝试失败 #{}（{}），上限 {} 次",
+                     n, why, config_.max_init_attempts);
+        if (n >= config_.max_init_attempts) enter_unknown_area(why);
+    }
+
+    void enter_unknown_area(const std::string& why) {
+        state_ = SystemState::UNKNOWN_AREA;
+        {
+            std::lock_guard<std::mutex> lock(data_mtx_);
+            accumulated_cloud_odom_->clear();
+            accumulation_started_ = false;
+            job_.has_new_job = false;
+        }
+        unknown_area_since_ = std::chrono::steady_clock::now();
+        logger->warn("[Initializer] 连续 {} 次初始化失败（{}），判定为陌生区域：停止匹配（action={}）",
+                     init_failures_.load(), why, config_.unknown_area_action);
+        publish_initializer_status("UNKNOWN_AREA", fins::now());
+        if (config_.unknown_area_action == "exit") {
+            logger->warn("[Initializer] unknown_area_action=exit，退出定位进程"
+                         "（注意：localization.py 看门狗会重启它，如需彻底停用请一并处理）");
+            std::exit(0);
+        }
+    }
+
+    void publish_initializer_status(const std::string& s, const fins::AcqTime& ts) {
+        if (!required("initializer_status")) return;
+        std_msgs::msg::String msg;
+        msg.data = s;
+        send("initializer_status", msg, ts);
     }
 
     void load_map(const std::string& path) {
@@ -382,8 +504,11 @@ private:
 
         map_ready_ = true;
         state_ = SystemState::COARSE_LOCALIZATION;
-        logger->info("Global Map loaded. Algo points: {}, Viz points: {}, Viz Grid: {}m", 
+        logger->info("Global Map loaded. Algo points: {}, Viz points: {}, Viz Grid: {}m",
                      map_algo->size(), map_viz_cloud_->size(), config_.viz_leaf_size);
+
+        // 初始状态定格：Transient Local 的迟订阅者需要拿到 SEARCHING 初值
+        publish_initializer_status("SEARCHING", fins::now());
                      
         if (map_viz_cloud_ && required("global_map_viz")) {
             map_viz_cloud_->header.frame_id = "map";
@@ -393,17 +518,35 @@ private:
 
     void on_tracking_status(const std_msgs::msg::String &msg) {
         if (!config_.initialization_only) return;
-        std::lock_guard<std::mutex> lock(data_mtx_);
-        bool reset_requested = (msg.data == "LOST" && last_tracking_status_ != "LOST") ||
-                               msg.data == "INITIALIZATION_REJECTED";
-        last_tracking_status_ = msg.data;
-        if (reset_requested && state_ == SystemState::FINE_LOCALIZATION) {
-            state_ = SystemState::COARSE_LOCALIZATION;
-            accumulated_cloud_odom_->clear();
-            accumulation_started_ = false;
-            job_.has_new_job = false;
-            logger->warn("[Initializer] Tracker requested reinitialization: {}", msg.data);
+        std::string failure;   // 锁外计数，避免 note_init_failure 内部加锁与 data_mtx_ 死锁
+        bool reinit = false;
+        {
+            std::lock_guard<std::mutex> lock(data_mtx_);
+            bool reset_requested = (msg.data == "LOST" && last_tracking_status_ != "LOST") ||
+                                   msg.data == "INITIALIZATION_REJECTED";
+            last_tracking_status_ = msg.data;
+            if (msg.data == "LOCKED") {
+                // 跟踪稳定 = 这次初始化成功，清零失败计数
+                init_failures_ = 0;
+                init_accepted_pending_ = false;
+            } else if (reset_requested) {
+                if (init_accepted_pending_) {
+                    init_accepted_pending_ = false;
+                    failure = "接受后未到 LOCKED 即丢失（对齐位置很可能不对）";
+                } else if (state_ == SystemState::FINE_LOCALIZATION) {
+                    failure = "跟踪丢失";
+                }
+                if (state_ == SystemState::FINE_LOCALIZATION) {
+                    state_ = SystemState::COARSE_LOCALIZATION;
+                    accumulated_cloud_odom_->clear();
+                    accumulation_started_ = false;
+                    job_.has_new_job = false;
+                    reinit = true;
+                }
+            }
         }
+        if (reinit) logger->warn("[Initializer] Tracker requested reinitialization: {}", msg.data);
+        if (!failure.empty()) note_init_failure(failure);
     }
 
     void on_odom_tf_callback(const fins::Msg<geometry_msgs::msg::TransformStamped>& msg) {
@@ -426,6 +569,24 @@ private:
 
     void on_cloud_callback(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_odom_in, fins::AcqTime acq_time) {
         std::unique_lock<std::mutex> lock(data_mtx_);
+        if (state_ == SystemState::UNKNOWN_AREA) {
+            // 陌生区域：默认停止匹配（不再累积/搜索，BBS 与 GICP 不再烧 CPU/内存）。
+            // 配置了 unknown_area_retry_sec>0 时按周期放行一轮重试。
+            if (config_.unknown_area_retry_sec > 0.0) {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - unknown_area_since_).count()
+                        >= config_.unknown_area_retry_sec) {
+                    init_failures_ = 0;
+                    init_accepted_pending_ = false;
+                    accumulation_started_ = false;
+                    state_ = SystemState::COARSE_LOCALIZATION;
+                    logger->info("[Initializer] 陌生区域停留 {}s 后重试匹配",
+                                 config_.unknown_area_retry_sec);
+                    publish_initializer_status("SEARCHING", acq_time);
+                }
+            }
+            return;
+        }
         if (!map_ready_ || state_ == SystemState::IDLE) return;
         if (config_.initialization_only && state_ != SystemState::COARSE_LOCALIZATION) return;
         double cur_time = fins::to_seconds(acq_time);
@@ -571,12 +732,35 @@ private:
             logger->info("[3dBBS->GICP] Refine converged={}, error={:.2f}, iter={}, time={:.2f}ms", 
                          res.converged, res.error, res.iterations, refine_duration_ms);
 
-            if (config_.initialization_only && (!res.converged || !std::isfinite(res.error) ||
-                res.error > config_.max_gicp_error || !res.T_target_source.matrix().allFinite())) {
-                logger->warn("[Initializer] BBS candidate rejected: GICP refinement did not pass quality gate");
-                return;
-            }
             Eigen::Isometry3d T_map_base_final = res.converged ? res.T_target_source : T_map_base_bbs;
+
+            if (config_.initialization_only) {
+                // 接受门控：res.error 是 covariance 加权残差和、不是米制量，错位候选靠少量
+                // 远距对应点也能把它拉低（实测错位 accept 的 error=1134，正确 accept 反而
+                // 12000~15500）。必须独立复核「变换后的源点是否真的落在地图上」。
+                const double inlier_ratio = source_down->empty() ? 0.0
+                    : double(res.num_inliers) / double(source_down->size());
+                const OverlapStat ov = verify_overlap(source_down, T_map_base_final);
+                const bool accept = res.converged && std::isfinite(res.error)
+                    && res.error <= config_.max_gicp_error
+                    && res.T_target_source.matrix().allFinite()
+                    && int(res.num_inliers) >= config_.min_init_inliers
+                    && inlier_ratio >= config_.min_init_inlier_ratio
+                    && ov.ratio >= config_.min_init_overlap_ratio;
+                if (!accept) {
+                    // 注意：fmt 不支持 {:.0%} 格式说明符（invalid format specifier
+                    // 会直接 throw 到 terminate），百分比一律 ×100 用 {:.0f} 输出。
+                    logger->warn("[Initializer] BBS candidate rejected: inliers={} ({:.0f}%), "
+                                 "map overlap={:.0f}% (need >={:.0f}% @ {}m), error={:.1f}",
+                                 res.num_inliers, 100.0 * inlier_ratio, 100.0 * ov.ratio,
+                                 100.0 * config_.min_init_overlap_ratio,
+                                 config_.init_verify_max_dist, res.error);
+                    note_init_failure("候选未通过落图复核");
+                    return;
+                }
+                logger->info("[Initializer] 落图复核通过: inliers={} ({:.0f}%), map overlap={:.0f}%",
+                             res.num_inliers, 100.0 * inlier_ratio, 100.0 * ov.ratio);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(data_mtx_);
@@ -586,6 +770,7 @@ private:
                 has_filtered_pose_ = false;
                 state_ = SystemState::FINE_LOCALIZATION;
                 consecutive_gicp_failures_ = 0;
+                init_accepted_pending_ = true;   // 等 LOCKED 才算真正成功
                 // 清空累积点云，为精定位阶段的 1s 累积做准备
                 accumulated_cloud_odom_->clear();
                 last_gicp_run_time_ = -1.0;  // 标记：等待首个点云到达时开始计时
@@ -601,10 +786,18 @@ private:
                 alignment.transform = tf2::eigenToTransform(T_map_odom_).transform;
                 send("initial_alignment", alignment, job.ts);
                 logger->info("[Initializer] BBS + GICP accepted; handing map->odom alignment to FAST-LIO, no periodic GICP");
+                publish_initializer_status("INITIALIZED", job.ts);
             }
             publish_results(job.ts, job.cloud_odom, job.T_odom_base);
         } else {
-            logger->warn("[3dBBS] Localization failed. Time: {:.2f}ms", duration_ms);
+            if (bbs3d_->has_timed_out()) {
+                logger->warn("[3dBBS] 搜索超时（上限 {}ms），按未匹配处理。Time: {:.2f}ms",
+                             config_.bbs_timeout_msec, duration_ms);
+                note_init_failure("3dBBS 搜索超时（按未匹配计）");
+            } else {
+                logger->warn("[3dBBS] Localization failed. Time: {:.2f}ms", duration_ms);
+                note_init_failure("3dBBS 未匹配到候选");
+            }
         }
     }
 
@@ -935,6 +1128,11 @@ private:
     double start_accumulation_time_ = 0.0;
     double last_gicp_run_time_ = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr accumulated_cloud_odom_;
+
+    // 初始化尝试计数（陌生区域停搜）；原子量避免 worker / 状态回调并发读写
+    std::atomic<int> init_failures_{0};
+    std::atomic<bool> init_accepted_pending_{false};
+    std::chrono::steady_clock::time_point unknown_area_since_;
 
     JobData job_;
     std::atomic<bool> is_processing_job_{false};
