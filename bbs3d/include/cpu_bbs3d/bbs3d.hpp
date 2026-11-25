@@ -110,6 +110,22 @@ public:
 
   bool save_voxel_params(const std::string& folder_path);
 
+  /// 加权体素图二进制缓存：保留每个 bucket 的 .w() 权重（core=2/neighbor=1）
+  /// 与空槽哨兵（w=0）。上游 save_voxelmaps_pcd 只存 xyz、读回把 w 一律设为 1，
+  /// 会破坏加权 BBS 的分数语义，故另存一份二进制缓存。
+  bool save_voxelmaps_cache(const std::string& folder_path,
+                            const std::string& source_map_path);
+
+  /// 载入缓存；若源 map.pcd 的 size/mtime_ns 与缓存不符、配置参数不符或文件损坏，
+  /// 返回 false，调用方应回退到 set_tar_points() 重建。
+  /// expected_min_res/expected_max_level/expected_neighbor_score 为当前配置值，
+  /// 用于判定体素图参数是否变化（变了就必须重建）。
+  bool load_voxelmaps_cache(const std::string& folder_path,
+                            const std::string& source_map_path,
+                            double expected_min_res,
+                            int expected_max_level,
+                            double expected_neighbor_score);
+
 private:
   void calc_angular_info(std::vector<AngularInfo>& ang_info_vec);
 

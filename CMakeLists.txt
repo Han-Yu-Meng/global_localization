@@ -23,6 +23,7 @@ add_library(cpu_bbs3d
   bbs3d/src/cpu_bbs3d/bbs3d.cpp
   bbs3d/src/cpu_bbs3d/voxelmaps.cpp
   bbs3d/src/cpu_bbs3d/voxelmaps_io.cpp
+  bbs3d/src/cpu_bbs3d/voxelmaps_cache.cpp
 )
 
 set_target_properties(cpu_bbs3d PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -446,9 +446,27 @@ private:
 
         std::vector<Eigen::Vector3d> tar_points;
         for (auto& p : map_algo->points) tar_points.push_back(p.getVector3fMap().cast<double>());
-        // 邻居体素分数在建体素图时固化，必须在 set_tar_points() 之前设置
-        bbs3d_->set_neighbor_score(config_.neighbor_score);
-        bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
+
+        // 多层加权体素图：优先加载二进制缓存（保留 bucket 权重与空槽），
+        // 缓存里记录的源 map.pcd size/mtime 或体素参数与当前不符则失效重建。
+        // 这样建图落盘更新地图后不会拿旧体素图匹配（配合 localization.py 的进程重启）。
+        bool voxel_cache_hit = false;
+        if (!config_.voxel_dir.empty()) {
+            voxel_cache_hit = bbs3d_->load_voxelmaps_cache(
+                config_.voxel_dir, path,
+                config_.min_level_res, config_.max_level, config_.neighbor_score);
+        }
+        if (!voxel_cache_hit) {
+            // 邻居体素分数在建体素图时固化，必须在 set_tar_points() 之前设置
+            bbs3d_->set_neighbor_score(config_.neighbor_score);
+            bbs3d_->set_tar_points(tar_points, config_.min_level_res, config_.max_level);
+            if (!config_.voxel_dir.empty()) {
+                bbs3d_->save_voxelmaps_cache(config_.voxel_dir, path);
+            }
+        } else {
+            logger->info("[3dBBS] 使用缓存的加权体素图，跳过 create_voxelmaps ({} 层)",
+                         config_.max_level + 1);
+        }
         bbs3d_->set_score_threshold_percentage(config_.score_threshold);
         bbs3d_->set_nms_thresholds(config_.nms_dist_thresh, config_.nms_angle_thresh_deg);
         bbs3d_->set_num_threads(config_.num_threads);
